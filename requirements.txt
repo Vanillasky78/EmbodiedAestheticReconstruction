@@ -1,9 +1,7 @@
-```
 streamlit
-mediapipe
 opencv-python
 numpy
 pillow
-scikit-learn
-scipy
-```
+torch
+torchvision
+torchaudio
