@@ -34,3 +34,4 @@ embodied-aesthetic-reconstruction/
 ├── outputs/                # Generated media (gitignored)
 ├── requirements.txt        # Dependencies
 └── README.md               # Project description
+
