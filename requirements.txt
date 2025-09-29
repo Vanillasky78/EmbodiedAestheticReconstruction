@@ -1,7 +1,13 @@
 streamlit
-opencv-python
-numpy
+numpy<2.0
+scikit-learn
 pillow
+opencv-contrib-python==4.10.0.84
 torch
 torchvision
 torchaudio
+faiss-cpu
+open_clip_torch
+mediapipe==0.10.21
+tqdm
+requests
