@@ -1,13 +1,35 @@
-streamlit
-numpy<2.0
-scikit-learn
+# Core
+numpy
 pillow
-opencv-contrib-python==4.10.0.84
+tqdm
+requests
+
+# Streamlit app
+streamlit
+watchdog
+
+# Computer Vision
+opencv-python
+opencv-contrib-python
+scikit-image
+
+# Machine Learning / Deep Learning
 torch
 torchvision
 torchaudio
+scikit-learn
+
+# Feature Extraction
 faiss-cpu
-open_clip_torch
-mediapipe==0.10.21
-tqdm
-requests
+sentencepiece
+open-clip-torch
+
+# Optional audio/visual processing
+sounddevice
+matplotlib
+
+# HuggingFace utils
+huggingface-hub
+
+# Extra utilities
+pyyaml
