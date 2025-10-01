@@ -1,18 +1,6 @@
-# indexing/download_met.py
-"""
-Robust Met Museum Open Access downloader (public-domain only).
-
-Features
-- CLI args (query, count, outdir, department, min_width/height)
-- Resumable: skips images already on disk
-- Retries with timeouts, polite rate limiting
-- Saves JSONL metadata (one line per image) for provenance
-- Validates images and converts to RGB .jpg
-"""
-
+# 用模块模式运行：python -m indexing.download_met --count 50 --resume
 import argparse
 import json
-import os
 import time
 from io import BytesIO
 from pathlib import Path
@@ -25,23 +13,17 @@ from tqdm import tqdm
 SEARCH_API = "https://collectionapi.metmuseum.org/public/collection/v1/search"
 OBJECT_API = "https://collectionapi.metmuseum.org/public/collection/v1/objects/{}"
 
-UA = "EAR-Retrieval/1.0 (+for research; contact: you@example.com)"  # change if you like
+UA = "EAR-Retrieval/1.0 (+for research; contact: you@example.com)"  # 可自定义
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA})
 
+def ensure_dir(p: Path):
+    if p.exists() and p.is_file():
+        p.unlink()
+    p.mkdir(parents=True, exist_ok=True)
 
-def ensure_dir(path: Path) -> None:
-    if path.exists() and path.is_file():
-        path.unlink()  # remove file that blocks the folder name
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def search_ids(
-    q: str = "painting",
-    department_id: Optional[int] = None,
-    public_domain: bool = True,
-    has_images: bool = True,
-) -> List[int]:
+def search_ids(q: str = "painting", department_id: Optional[int] = None,
+               public_domain: bool = True, has_images: bool = True) -> List[int]:
     params = {"q": q}
     if public_domain:
         params["isPublicDomain"] = "true"
@@ -53,7 +35,6 @@ def search_ids(
     r.raise_for_status()
     data = r.json()
     return data.get("objectIDs", []) or []
-
 
 def iter_objects(ids: Iterable[int], retry: int = 3, sleep: float = 0.15):
     for oid in ids:
@@ -69,23 +50,18 @@ def iter_objects(ids: Iterable[int], retry: int = 3, sleep: float = 0.15):
                 else:
                     time.sleep(sleep * attempt)
 
-
 def pick_image_url(info: dict, prefer_original: bool = False) -> Optional[str]:
-    # Some objects have very large 'primaryImage'; use small if you just need thumbnails
     url = info.get("primaryImage") if prefer_original else info.get("primaryImageSmall")
     if not url:
-        # fall back to whatever exists
         url = info.get("primaryImage") or info.get("primaryImageSmall")
     return url or None
-
 
 def download_image(url: str, timeout: int = 30) -> Optional[Image.Image]:
     r = SESSION.get(url, timeout=timeout)
     r.raise_for_status()
     img = Image.open(BytesIO(r.content))
-    img.load()  # validate
+    img.load()
     return img.convert("RGB")
-
 
 def main():
     ap = argparse.ArgumentParser(description="Download Met Museum Open Access images.")
@@ -97,7 +73,7 @@ def main():
     ap.add_argument("--min_w", type=int, default=400, help="Min width to accept")
     ap.add_argument("--min_h", type=int, default=400, help="Min height to accept")
     ap.add_argument("--resume", action="store_true", help="Skip files already on disk")
-    ap.add_argument("--sleep", type=float, default=0.15, help="Polite delay between requests")
+    ap.add_argument("--sleep", type=float, default=0.15, help="Delay between requests")
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
@@ -110,7 +86,6 @@ def main():
         print("[error] no results from Met API. try another query.")
         return
 
-    # existing ids on disk (for resume)
     existing = set()
     if args.resume:
         for p in outdir.glob("*.jpg"):
@@ -129,7 +104,6 @@ def main():
             if not img_url:
                 continue
 
-            # basic metadata (provenance)
             meta = {
                 "objectID": oid,
                 "title": info.get("title"),
@@ -147,14 +121,12 @@ def main():
                 w, h = img.size
                 if w < args.min_w or h < args.min_h:
                     continue
-
                 fname = outdir / f"{oid}.jpg"
                 img.save(fname, quality=90)
 
                 mf.write(json.dumps(meta, ensure_ascii=False) + "\n")
                 saved += 1
                 time.sleep(args.sleep)
-
                 if saved >= args.count:
                     break
             except Exception as e:
@@ -163,7 +135,6 @@ def main():
 
     print(f"[done] saved {saved} jpgs → {outdir}")
     print(f"[meta] appended provenance to {meta_path}")
-
 
 if __name__ == "__main__":
     main()
