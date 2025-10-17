@@ -1,49 +1,51 @@
-import os
-import json
-import faiss
-import numpy as np
-from typing import List, Optional
-from PIL import Image
+from __future__ import annotations
+from . import pose as pose_mod
+from .similarity import pose_similarity, color_similarity, combine_score
+import cv2, numpy as np
 
-import open_clip, torch
+class Matcher:
+    def __init__(self, faiss_index, id_list, meta_list, clip_model, clip_preprocess, device="cpu"):
+        self.index = faiss_index
+        self.ids = id_list
+        self.meta = meta_list
+        self.model = clip_model
+        self.preprocess = clip_preprocess
+        self.device = device
 
-def load_clip(device: Optional[str] = None):
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, _, preprocess = open_clip.create_model_and_transforms("ViT-L-14", pretrained="openai")
-    model = model.to(device).eval()
-    return model, preprocess, device
+    def encode_image(self, pil_img):
+        import torch
+        with torch.no_grad():
+            t = self.preprocess(pil_img).unsqueeze(0).to(self.device)
+            f = self.model.encode_image(t)
+            f = f / f.norm(dim=-1, keepdim=True)
+            return f.cpu().numpy().astype("float32")
 
-@torch.no_grad()
-def embed_image(model, preprocess, device, img: Image.Image) -> np.ndarray:
-    x = preprocess(img).unsqueeze(0).to(device)
-    f = model.encode_image(x)
-    f = f / f.norm(dim=-1, keepdim=True)
-    return f.cpu().numpy().astype("float32")
+    def search(self, pil_img, k=200, weights=None, filters=None):
+        # Step 1: CLIP+FAISS shortlist
+        q = self.encode_image(pil_img)
+        sims, idxs = self.index.search(q, k)
+        idxs = idxs[0]
+        base = [(int(i), float(s)) for i, s in zip(idxs, sims[0]) if i >= 0]
 
-class CorpusIndex:
-    def __init__(self, index_dir: str):
-        self.index_dir = index_dir
-        req = ["faiss.index", "feats.f32.npy", "paths.jsonl", "poses.npy"]
-        missing = [f for f in req if not os.path.exists(os.path.join(index_dir, f))]
-        if missing:
-            raise FileNotFoundError(
-                f"索引目录不完整：{index_dir}\n缺少：{', '.join(missing)}\n"
-                f"请先运行：python -m indexing.build_index --corpus data/corpus_sample/paintings --outdir {index_dir}"
-            )
-        self.index = faiss.read_index(os.path.join(index_dir, "faiss.index"))
-        self.feats = np.load(os.path.join(index_dir, "feats.f32.npy"))
-        self.paths: List[str] = []
-        with open(os.path.join(index_dir, "paths.jsonl"), "r", encoding="utf-8") as f:
-            for line in f:
-                self.paths.append(json.loads(line)["path"])
-        self.poses = np.load(os.path.join(index_dir, "poses.npy"), allow_pickle=True)  # array of (N,2) or None
+        # Step 2: Pose & color for the query
+        pr = pose_mod.extract_pose(pil_img)
+        q_kps = pr.keypoints
+        q_bgr = cv2.cvtColor(np.array(pil_img.convert('RGB')), cv2.COLOR_RGB2BGR)
 
-    def search(self, qfeat: np.ndarray, topk=5):
-        sims, ids = self.index.search(qfeat, topk)
-        return sims[0], ids[0]
+        # Step 3: Re-rank by multi-metric
+        ranked = []
+        for i, s_clip in base:
+            m = self.meta[i]
+            if filters and filters.get('require_public_domain', False):
+                lic = str(m.get('license','')).lower()
+                if lic not in ['public domain','cc0']:
+                    continue
+            cand = cv2.imread(m.get('image_path','')) if m.get('image_path') else None
+            sim_pose = 0.0  # placeholder: add candidate pose cache if available
+            sim_color = color_similarity(q_bgr, cand) if cand is not None else 0.0
+            bonus = 0.02 if str(m.get('license','')).lower() in ['public domain','cc0'] else 0.0
+            score = combine_score(s_clip, sim_pose, sim_color, meta_bonus=bonus, w=weights)
+            ranked.append((i, score))
 
-def fuse_scores(clip_sim: float, pose_sim: Optional[float], alpha: float = 0.8) -> float:
-    if pose_sim is None:
-        return float(clip_sim)
-    return float(alpha * clip_sim + (1 - alpha) * pose_sim)
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        return [(self.ids[i], self.meta[i], sc) for i, sc in ranked[:50]]
