@@ -2,10 +2,18 @@
 # ------------------------------------------------------------
 # Usage:
 #   streamlit run app.py
-# Prereqs:
-#   python indexing/build_index.py --dataset_jsonl data/interim/portrait_art_dataset.jsonl --images_dir data/images
+#
+# Prereqs (build index first):
+#   python indexing/build_index.py \
+#     --dataset_jsonl data/interim/portrait_art_dataset.jsonl \
+#     --images_dir    data/images
 
-import os, json
+from __future__ import annotations
+import os
+import json
+from pathlib import Path
+from typing import Tuple, Any
+
 import numpy as np
 import streamlit as st
 from PIL import Image
@@ -18,6 +26,7 @@ import faiss
 # our retrieval logic
 from processors.retrieval import Matcher
 
+
 # --------------------------
 # App / page config
 # --------------------------
@@ -26,35 +35,41 @@ st.set_page_config(page_title="Portrait Match (Match-Only)", layout="wide")
 # --------------------------
 # Paths & constants
 # --------------------------
-INDEX_DIR = "indexing"
-INDEX_PATH = os.path.join(INDEX_DIR, "faiss.index")
-IDS_PATH   = os.path.join(INDEX_DIR, "ids.npy")
-META_PATH  = os.path.join(INDEX_DIR, "meta.json")
+INDEX_DIR  = Path("indexing")
+INDEX_PATH = INDEX_DIR / "faiss.index"
+IDS_PATH   = INDEX_DIR / "ids.npy"
+META_PATH  = INDEX_DIR / "meta.json"
+
 
 # --------------------------
 # Lazy-load CLIP + FAISS
 # --------------------------
 @st.cache_resource(show_spinner=True)
-def load_clip_and_index():
+def load_clip_and_index() -> Tuple[Matcher | None, Any | None, Any | None, str | None]:
+    """Load CLIP model + FAISS index + metadata, return a ready Matcher."""
     # 1) CLIP model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-B-32", pretrained="openai"
-    )
+    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
     model.eval().to(device)
 
     # 2) Index files
-    if not (os.path.exists(INDEX_PATH) and os.path.exists(IDS_PATH) and os.path.exists(META_PATH)):
-        return None, None, None, None
+    missing = [p for p in (INDEX_PATH, IDS_PATH, META_PATH) if not p.exists()]
+    if missing:
+        return None, None, None, device
 
-    index = faiss.read_index(INDEX_PATH)
-    ids   = np.load(IDS_PATH, allow_pickle=True)
-    with open(META_PATH, "r", encoding="utf-8") as f:
-        meta = json.load(f)
+    try:
+        index = faiss.read_index(str(INDEX_PATH))
+        ids   = np.load(str(IDS_PATH), allow_pickle=True)
+        meta  = json.loads(META_PATH.read_text(encoding="utf-8"))
 
-    # 3) Build matcher
-    matcher = Matcher(index, ids, meta, model, preprocess, device=device)
-    return matcher, model, preprocess, device
+        if not (len(ids) == len(meta)):
+            st.warning(f"Index/meta length mismatch: ids={len(ids)} meta={len(meta)}")
+        matcher = Matcher(index, ids, meta, model, preprocess, device=device)
+        return matcher, model, preprocess, device
+    except Exception as e:
+        st.error(f"Failed to load index/meta: {e}")
+        return None, None, None, device
+
 
 matcher, model, preprocess, device = load_clip_and_index()
 
@@ -91,36 +106,41 @@ st.caption("Upload a person photo; the system returns the most similar portrait 
 # --------------------------
 img_file = st.file_uploader("Upload portrait photo", type=["jpg", "jpeg", "png"])
 if img_file:
-    q = Image.open(img_file).convert("RGB")
+    try:
+        q = Image.open(img_file).convert("RGB")
+    except Exception:
+        st.error("Failed to read the uploaded image. Please try another file.")
+        st.stop()
+
     st.image(q, caption="Input", use_column_width=True)
 
     with st.spinner("Searching best matches..."):
         weights = dict(w_clip=w_clip, w_pose=w_pose, w_color=w_color)
         results = matcher.search(
             q, k=200, weights=weights,
-            filters={"require_public_domain": require_pd}
+            filters={"require_public_domain": require_pd},
+            topn=TOPK,
         )
-        results = results[:TOPK]
 
     if not results:
-        st.warning("No results. Try disabling Public Domain filter or using a clearer portrait image.")
+        st.warning("No results. Try disabling the Public Domain filter or using a clearer portrait image.")
     else:
         # grid display
         cols = st.columns(min(4, TOPK))
         for i, (rid, meta, score) in enumerate(results):
             c = cols[i % len(cols)]
             with c:
-                title  = meta.get("artwork_title_en", "Untitled")
-                artist = meta.get("artist_name_en", "Unknown")
-                year   = meta.get("year", "?")
-                museum = meta.get("museum", "")
-                lic    = meta.get("license", "?")
+                title  = meta.get("artwork_title_en") or meta.get("title") or "Untitled"
+                artist = meta.get("artist_name_en") or meta.get("artistDisplayName") or "Unknown"
+                year   = meta.get("year") or meta.get("objectDate") or "?"
+                museum = meta.get("museum") or meta.get("department") or ""
+                lic    = meta.get("license") or ("Public Domain" if meta.get("isPublicDomain") else "?")
                 img_p  = meta.get("image_path")
 
                 st.markdown(f"**{title}**")
                 st.caption(f"{artist} • {year} • {museum}")
                 st.caption(f"License: {lic} | Score: {score:.3f}")
-                if img_p and os.path.exists(img_p):
+                if img_p and Path(img_p).exists():
                     st.image(img_p, use_column_width=True)
                 else:
                     st.info("Image not cached locally.")
