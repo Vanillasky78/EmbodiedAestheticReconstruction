@@ -1,35 +1,10 @@
-# Core
-numpy
-pillow
-tqdm
-requests
-
-# Streamlit app
-streamlit
-watchdog
-
-# Computer Vision
-opencv-python
-opencv-contrib-python
-scikit-image
-
-# Machine Learning / Deep Learning
-torch
-torchvision
-torchaudio
-scikit-learn
-
-# Feature Extraction
-faiss-cpu
-sentencepiece
-open-clip-torch
-
-# Optional audio/visual processing
-sounddevice
-matplotlib
-
-# HuggingFace utils
-huggingface-hub
-
-# Extra utilities
-pyyaml
+torch>=2.1
+open-clip-torch>=2.24
+faiss-cpu>=1.7.4
+opencv-python>=4.10
+pillow>=10.3
+numpy>=1.26
+tqdm>=4.66
+requests>=2.32
+streamlit>=1.36
+mediapipe>=0.10 
