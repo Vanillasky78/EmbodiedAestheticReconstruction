@@ -8,3 +8,4 @@ tqdm>=4.66
 requests>=2.32
 streamlit>=1.36
 mediapipe>=0.10 
+pydantic>=2.0
