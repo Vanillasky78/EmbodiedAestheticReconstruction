@@ -9,7 +9,6 @@
 #     --images_dir    data/images
 
 from __future__ import annotations
-import os
 import json
 from pathlib import Path
 from typing import Tuple, Any
@@ -62,8 +61,13 @@ def load_clip_and_index() -> Tuple[Matcher | None, Any | None, Any | None, str |
         ids   = np.load(str(IDS_PATH), allow_pickle=True)
         meta  = json.loads(META_PATH.read_text(encoding="utf-8"))
 
-        if not (len(ids) == len(meta)):
+        if len(ids) == 0 or index.ntotal == 0:
+            st.warning("Index appears to be empty. Please rebuild it with some images.")
+            return None, None, None, device
+
+        if len(ids) != len(meta):
             st.warning(f"Index/meta length mismatch: ids={len(ids)} meta={len(meta)}")
+
         matcher = Matcher(index, ids, meta, model, preprocess, device=device)
         return matcher, model, preprocess, device
     except Exception as e:
@@ -77,7 +81,7 @@ matcher, model, preprocess, device = load_clip_and_index()
 if matcher is None:
     st.title("Portrait Match (Match-Only)")
     st.error(
-        "Index not found.\n\n"
+        "Index not found or empty.\n\n"
         "Please build it first:\n\n"
         "```bash\n"
         "python indexing/build_index.py \\\n"
@@ -95,7 +99,8 @@ st.sidebar.header("Match-Only Settings")
 w_clip  = st.sidebar.slider("Weight: CLIP",  0.0, 1.0, 0.60, 0.05)
 w_pose  = st.sidebar.slider("Weight: Pose",  0.0, 1.0, 0.30, 0.05)
 w_color = st.sidebar.slider("Weight: Color", 0.0, 1.0, 0.10, 0.05)
-require_pd = st.sidebar.checkbox("Require Public Domain/CC0", value=True)
+# 默认不强制公共版权，提高命中率；用户可自行勾选
+require_pd = st.sidebar.checkbox("Require Public Domain/CC0", value=False)
 TOPK = st.sidebar.slider("Top-K", 5, 50, 12)
 
 st.title("Portrait Match (Match-Only)")
@@ -116,14 +121,18 @@ if img_file:
 
     with st.spinner("Searching best matches..."):
         weights = dict(w_clip=w_clip, w_pose=w_pose, w_color=w_color)
+        # 注意：Matcher.search 不支持 topn 参数，这里只传 k/weights/filters
         results = matcher.search(
             q, k=200, weights=weights,
             filters={"require_public_domain": require_pd},
-            topn=TOPK,
         )
+        results = results[:TOPK]  # 在前端截断
 
     if not results:
-        st.warning("No results. Try disabling the Public Domain filter or using a clearer portrait image.")
+        tip = "No results. Try disabling the Public Domain filter or using a clearer portrait image."
+        if require_pd:
+            tip += " (You currently require Public Domain/CC0.)"
+        st.warning(tip)
     else:
         # grid display
         cols = st.columns(min(4, TOPK))
@@ -134,7 +143,10 @@ if img_file:
                 artist = meta.get("artist_name_en") or meta.get("artistDisplayName") or "Unknown"
                 year   = meta.get("year") or meta.get("objectDate") or "?"
                 museum = meta.get("museum") or meta.get("department") or ""
-                lic    = meta.get("license") or ("Public Domain" if meta.get("isPublicDomain") else "?")
+                lic    = meta.get("license")
+                if not lic:
+                    lic = "Public Domain" if bool(meta.get("isPublicDomain")) else "?"
+
                 img_p  = meta.get("image_path")
 
                 st.markdown(f"**{title}**")
