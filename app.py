@@ -1,162 +1,160 @@
-# app.py — Match-Only UI for Embodied Aesthetic Reconstruction
-# ------------------------------------------------------------
-# Usage:
-#   streamlit run app.py
-#
-# Prereqs (build index first):
-#   python indexing/build_index.py \
-#     --dataset_jsonl data/interim/portrait_art_dataset.jsonl \
-#     --images_dir    data/images
+"""
+app.py
+----------------------------------------
+Streamlit front-end for the Embodied Aesthetic Reconstruction system.
 
-from __future__ import annotations
-import json
-from pathlib import Path
-from typing import Tuple, Any
+Flow:
+1. Participant stands in front of the camera.
+2. The system waits until the participant holds still (~3 seconds).
+3. The system captures that exact frame.
+4. A pose skeleton is generated from the body keypoints (YOLOv8-Pose).
+5. The skeleton image is encoded with OpenCLIP to produce a pose embedding.
+6. The pose embedding is compared to a curated portrait dataset of historical artworks.
+7. The Top-3 closest portrait matches are displayed with contextual language.
 
-import numpy as np
+This file is meant to be run with:
+    streamlit run app.py
+
+Author: Xinyi Zhang
+"""
+
+import time
+import os
 import streamlit as st
 from PIL import Image
-
-# ML + ANN
-import torch
-import open_clip
-import faiss
-
-# our retrieval logic
-from processors.retrieval import Matcher
+from match_pose_to_artworks import run_full_capture_and_match
 
 
-# --------------------------
-# App / page config
-# --------------------------
-st.set_page_config(page_title="Portrait Match (Match-Only)", layout="wide")
+# ----------------------------------------
+# 1. Streamlit page config
+# ----------------------------------------
 
-# --------------------------
-# Paths & constants
-# --------------------------
-INDEX_DIR  = Path("indexing")
-INDEX_PATH = INDEX_DIR / "faiss.index"
-IDS_PATH   = INDEX_DIR / "ids.npy"
-META_PATH  = INDEX_DIR / "meta.json"
+st.set_page_config(
+    page_title="Embodied Aesthetic Reconstruction",
+    page_icon="🎨",
+    layout="wide",
+)
 
+st.title("🎭 Embodied Aesthetic Reconstruction")
+st.markdown(
+    """
+    **An AI-driven portrait experience that links your embodied presence to art history.**
 
-# --------------------------
-# Lazy-load CLIP + FAISS
-# --------------------------
-@st.cache_resource(show_spinner=True)
-def load_clip_and_index() -> Tuple[Matcher | None, Any | None, Any | None, str | None]:
-    """Load CLIP model + FAISS index + metadata, return a ready Matcher."""
-    # 1) CLIP model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
-    model.eval().to(device)
+    Stand in front of the camera.  
+    Hold your pose.  
+    The system will watch for stillness (about 3 seconds).  
+    When your presence feels stable, it will capture you — not to correct you, not to fix you —  
+    but to place you in a lineage of bodies that have already been seen, recorded, and given space.
+    """
+)
 
-    # 2) Index files
-    missing = [p for p in (INDEX_PATH, IDS_PATH, META_PATH) if not p.exists()]
-    if missing:
-        return None, None, None, device
-
-    try:
-        index = faiss.read_index(str(INDEX_PATH))
-        ids   = np.load(str(IDS_PATH), allow_pickle=True)
-        meta  = json.loads(META_PATH.read_text(encoding="utf-8"))
-
-        if len(ids) == 0 or index.ntotal == 0:
-            st.warning("Index appears to be empty. Please rebuild it with some images.")
-            return None, None, None, device
-
-        if len(ids) != len(meta):
-            st.warning(f"Index/meta length mismatch: ids={len(ids)} meta={len(meta)}")
-
-        matcher = Matcher(index, ids, meta, model, preprocess, device=device)
-        return matcher, model, preprocess, device
-    except Exception as e:
-        st.error(f"Failed to load index/meta: {e}")
-        return None, None, None, device
+st.markdown("---")
 
 
-matcher, model, preprocess, device = load_clip_and_index()
+# ----------------------------------------
+# 2. Action button
+# ----------------------------------------
 
-# If index missing, guide the user and stop.
-if matcher is None:
-    st.title("Portrait Match (Match-Only)")
-    st.error(
-        "Index not found or empty.\n\n"
-        "Please build it first:\n\n"
-        "```bash\n"
-        "python indexing/build_index.py \\\n"
-        "  --dataset_jsonl data/interim/portrait_art_dataset.jsonl \\\n"
-        "  --images_dir    data/images\n"
-        "```\n"
-        "Then rerun: `streamlit run app.py`"
-    )
+start = st.button("Start Pose Capture")
+
+if not start:
+    st.info("Click **Start Pose Capture** to begin.")
     st.stop()
 
-# --------------------------
-# Sidebar controls
-# --------------------------
-st.sidebar.header("Match-Only Settings")
-w_clip  = st.sidebar.slider("Weight: CLIP",  0.0, 1.0, 0.60, 0.05)
-w_pose  = st.sidebar.slider("Weight: Pose",  0.0, 1.0, 0.30, 0.05)
-w_color = st.sidebar.slider("Weight: Color", 0.0, 1.0, 0.10, 0.05)
-# 默认不强制公共版权，提高命中率；用户可自行勾选
-require_pd = st.sidebar.checkbox("Require Public Domain/CC0", value=False)
-TOPK = st.sidebar.slider("Top-K", 5, 50, 12)
 
-st.title("Portrait Match (Match-Only)")
-st.caption("Upload a person photo; the system returns the most similar portrait artworks (no fusion).")
+# ----------------------------------------
+# 3. Run full backend pipeline
+# ----------------------------------------
 
-# --------------------------
-# File uploader
-# --------------------------
-img_file = st.file_uploader("Upload portrait photo", type=["jpg", "jpeg", "png"])
-if img_file:
-    try:
-        q = Image.open(img_file).convert("RGB")
-    except Exception:
-        st.error("Failed to read the uploaded image. Please try another file.")
-        st.stop()
+with st.spinner("🧍 Detecting pose... Please hold still for ~3 seconds..."):
+    start_time = time.time()
+    result = run_full_capture_and_match()
+    duration = time.time() - start_time
 
-    st.image(q, caption="Input", use_column_width=True)
-
-    with st.spinner("Searching best matches..."):
-        weights = dict(w_clip=w_clip, w_pose=w_pose, w_color=w_color)
-        # 注意：Matcher.search 不支持 topn 参数，这里只传 k/weights/filters
-        results = matcher.search(
-            q, k=200, weights=weights,
-            filters={"require_public_domain": require_pd},
-        )
-        results = results[:TOPK]  # 在前端截断
-
-    if not results:
-        tip = "No results. Try disabling the Public Domain filter or using a clearer portrait image."
-        if require_pd:
-            tip += " (You currently require Public Domain/CC0.)"
-        st.warning(tip)
-    else:
-        # grid display
-        cols = st.columns(min(4, TOPK))
-        for i, (rid, meta, score) in enumerate(results):
-            c = cols[i % len(cols)]
-            with c:
-                title  = meta.get("artwork_title_en") or meta.get("title") or "Untitled"
-                artist = meta.get("artist_name_en") or meta.get("artistDisplayName") or "Unknown"
-                year   = meta.get("year") or meta.get("objectDate") or "?"
-                museum = meta.get("museum") or meta.get("department") or ""
-                lic    = meta.get("license")
-                if not lic:
-                    lic = "Public Domain" if bool(meta.get("isPublicDomain")) else "?"
-
-                img_p  = meta.get("image_path")
-
-                st.markdown(f"**{title}**")
-                st.caption(f"{artist} • {year} • {museum}")
-                st.caption(f"License: {lic} | Score: {score:.3f}")
-                if img_p and Path(img_p).exists():
-                    st.image(img_p, use_column_width=True)
-                else:
-                    st.info("Image not cached locally.")
-
-# Footer
+st.success(f"✅ Capture complete in {duration:.1f} seconds.")
 st.markdown("---")
-st.caption("MSc Final Project — Embodied Aesthetic Reconstruction | Match-Only Mode (no fusion).")
+
+
+# ----------------------------------------
+# 4. Show captured participant data
+# ----------------------------------------
+
+st.markdown("## 📸 Your Captured Pose")
+
+col_left, col_right = st.columns(2)
+
+with col_left:
+    st.subheader("Original Frame")
+    if os.path.exists(result["locked_frame_path"]):
+        st.image(
+            result["locked_frame_path"],
+            caption="Captured frame from camera",
+            use_container_width=True,
+        )
+    else:
+        st.warning("Captured frame not found on disk.")
+
+with col_right:
+    st.subheader("Extracted Pose Skeleton")
+    if os.path.exists(result["skeleton_path"]):
+        st.image(
+            result["skeleton_path"],
+            caption="Body keypoints rendered as a skeleton silhouette",
+            use_container_width=True,
+        )
+    else:
+        st.warning("Skeleton pose image not found on disk.")
+
+st.markdown("---")
+
+
+# ----------------------------------------
+# 5. Show Top-3 artwork matches
+# ----------------------------------------
+
+st.markdown("## 🖼 Top 3 Portrait Matches")
+
+matches = result["results"]
+
+for match in matches:
+    artist = match["artist"]
+    title = match["title"]
+    year = match["year"]
+    score = match["score"]
+    notes = match["notes_pose"]
+    file_name = match["file_name"]
+
+    st.markdown(
+        f"""
+        ### {match['rank']}. {artist} — *{title}* ({year})
+        **Similarity score:** {score:.4f}  
+        **Pose reading / embodied attitude:**  
+        {notes}
+        """
+    )
+
+    # Try to display the reference artwork image
+    artwork_img_path = os.path.join("data", "images", file_name)
+
+    if os.path.exists(artwork_img_path):
+        st.image(
+            artwork_img_path,
+            caption=f"{title} / {artist}",
+            use_container_width=True,
+        )
+    else:
+        st.info(f"(Artwork image not found: {artwork_img_path})")
+
+    st.markdown("---")
+
+
+# ----------------------------------------
+# 6. Final message
+# ----------------------------------------
+
+st.markdown("### ✨ Embodied Aesthetic Reconstruction complete")
+st.balloons()
+st.caption(
+    "This system does not grade your body. It does not correct your body. "
+    "It acknowledges your body as already belonging to a visual lineage."
+)

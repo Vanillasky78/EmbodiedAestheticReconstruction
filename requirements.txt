@@ -1,11 +1,21 @@
-torch>=2.1
-open-clip-torch>=2.24
-faiss-cpu>=1.7.4
-opencv-python>=4.10
-pillow>=10.3
-numpy>=1.26
-tqdm>=4.66
-requests>=2.32
-streamlit>=1.36
-mediapipe>=0.10 
-pydantic>=2.0
+# Core numerical / ML
+torch
+torchvision
+torchaudio
+numpy
+pandas
+scikit-learn
+
+# Pose estimation
+ultralytics
+opencv-python
+
+# CLIP-style embeddings
+open_clip_torch
+Pillow
+
+# Web / UI layer (for app.py)
+streamlit
+
+# Progress bars / nice CLI feedback (optional but helpful)
+tqdm
