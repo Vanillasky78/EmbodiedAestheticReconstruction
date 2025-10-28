@@ -1,114 +1,144 @@
 """
-Quick pipeline test: load CLIP + FAISS, run retrieval on one image.
+test_pipeline.py
+----------------------------------------
+Lightweight sanity check for the Embodied Aesthetic Reconstruction system.
 
-Usage:
-    python test_pipeline.py --img path/to/input.jpg
-Options:
-    --index_dir   indexing directory containing faiss.index / ids.npy / meta.json
-    --topk        number of results to print (default: 5)
-    --k           FAISS shortlist size before re-ranking (default: 200)
-    --w_clip      weight for CLIP similarity (default: 0.6)
-    --w_pose      weight for pose similarity  (default: 0.3)
-    --w_color     weight for color similarity (default: 0.1)
-    --require_pd  require Public Domain/CC0 (default: False)
+This script does NOT use the camera.
+Instead, it:
+1. Loads a pre-generated skeleton pose image (black background, white joints/limbs).
+2. Encodes that pose image using OpenCLIP (ViT-B/32).
+3. Loads the curated portrait artwork database and its embeddings.
+4. Computes cosine similarity and prints the Top-3 matches.
+
+Use this to verify:
+- open_clip is installed and working
+- embeddings in data/embeddings/ are readable
+- retrieval logic works
+- CSV and file paths are correct
+
+Run:
+    python test_pipeline.py --pose data/interim/pose_frames/example_pose.png
 """
 
-from __future__ import annotations
+import os
 import argparse
-from pathlib import Path
-import json
-
 import numpy as np
-from PIL import Image
-
-# ANN / model
-import faiss
 import torch
-import open_clip
+import pandas as pd
+from PIL import Image
+from sklearn.metrics.pairwise import cosine_similarity
+from open_clip import create_model_and_transforms
 
-# our modules
-from processors.retrieval import Matcher
-
-
-def load_clip(device: str | None = None):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
-    model.eval().to(device)
-    return model, preprocess, device
+from processors.retrieval import ArtworkDatabase
 
 
-def load_index(index_dir: Path):
-    index = faiss.read_index(str(index_dir / "faiss.index"))
-    ids = np.load(str(index_dir / "ids.npy"), allow_pickle=True)
-    meta = json.loads((index_dir / "meta.json").read_text(encoding="utf-8"))
-    if len(ids) != len(meta):
-        print(f"[warn] ids ({len(ids)}) and meta ({len(meta)}) length mismatch")
-    return index, ids, meta
+CSV_PATH = "data/portrait_works.csv"
+DEVICE = "cuda" if torch.cuda.is_available() else (
+    "mps" if torch.backends.mps.is_available() else "cpu"
+)
+
+MODEL_NAME = "ViT-B-32"
+PRETRAINED = "openai"
 
 
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--img", required=True, help="Input image for testing")
-    ap.add_argument("--index_dir", default="indexing", help="Directory with FAISS index and metadata")
-    ap.add_argument("--topk", type=int, default=5, help="Top-N results to print")
-    ap.add_argument("--k", type=int, default=200, help="FAISS shortlist size before re-ranking")
-    ap.add_argument("--w_clip", type=float, default=0.6, help="Weight: CLIP")
-    ap.add_argument("--w_pose", type=float, default=0.3, help="Weight: Pose")
-    ap.add_argument("--w_color", type=float, default=0.1, help="Weight: Color")
-    ap.add_argument("--require_pd", action="store_true", help="Require Public Domain/CC0")
-    return ap.parse_args()
+def encode_pose_image(pose_img_path, clip_model, preprocess, device):
+    """
+    Load a pose skeleton image (RGB), convert to CLIP embedding.
+    Returns np.ndarray shape (1, D), L2-normalized.
+    """
+    img = Image.open(pose_img_path).convert("RGB")
+    tensor = preprocess(img).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        emb = clip_model.encode_image(tensor)
+        emb /= emb.norm(dim=-1, keepdim=True)
+
+    return emb.cpu().numpy()  # shape (1, D)
+
+
+def retrieve_top_k(user_emb, db, k=3):
+    """
+    Manual version of the retrieval stage.
+    We do this explicitly in test_pipeline for clarity.
+    """
+    # Load all artwork embeddings + rows
+    embeddings_matrix, rows = db.load_all_embeddings()  # embeddings_matrix: (N, D)
+
+    # Compute cosine similarity
+    scores = cosine_similarity(user_emb, embeddings_matrix)[0]  # shape (N,)
+
+    # Get top-k indices
+    idx_sorted = np.argsort(scores)[::-1][:k]
+
+    results = []
+    for rank, idx in enumerate(idx_sorted, start=1):
+        row = rows[idx]
+        result = {
+            "rank": rank,
+            "artist": row["artist_en"],
+            "title": row["title_en"],
+            "year": row["year"],
+            "score": float(scores[idx]),
+            "notes_pose": row["notes_pose"],
+            "file_name": row["file_name"],
+        }
+        results.append(result)
+
+    return results
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--pose",
+        required=True,
+        help="Path to a skeleton pose image (e.g. data/interim/pose_frames/example_pose.png)"
+    )
+    args = parser.parse_args()
 
-    # 1) load model + index
-    model, preprocess, device = load_clip()
-    index, ids, meta = load_index(Path(args.index_dir))
-    matcher = Matcher(index, ids, meta, model, preprocess, device=device)
+    pose_img_path = args.pose
+    if not os.path.exists(pose_img_path):
+        raise FileNotFoundError(f"Pose image not found: {pose_img_path}")
 
-    # 2) read input image
-    img = Image.open(args.img).convert("RGB")
+    print(f"🔧 Device: {DEVICE}")
+    print(f"🔍 Using pose image: {pose_img_path}")
 
-    # 3) search
-    weights = dict(w_clip=args.w_clip, w_pose=args.w_pose, w_color=args.w_color)
-    filters = {"require_public_domain": bool(args.require_pd)}
-    results = matcher.search(img, k=args.k, weights=weights, filters=filters, topn=args.topk)
+    # 1. Init CLIP
+    print("📦 Loading OpenCLIP model...")
+    clip_model, preprocess, _ = create_model_and_transforms(
+        MODEL_NAME,
+        pretrained=PRETRAINED
+    )
+    clip_model = clip_model.to(DEVICE)
+    clip_model.eval()
 
-    # 4) print results
-    if not results:
-        print("[RESULTS] no match found (try relaxing filters or using another image).")
-        return
+    # 2. Encode the provided pose skeleton
+    print("🧍 Encoding pose skeleton...")
+    user_emb = encode_pose_image(
+        pose_img_path,
+        clip_model,
+        preprocess,
+        DEVICE
+    )  # shape (1, D)
 
+    # 3. Load portrait database
+    print("📚 Loading artwork database...")
+    db = ArtworkDatabase(csv_path=CSV_PATH)
+
+    # 4. Retrieve top matches
+    print("🎯 Retrieving Top-3 matches...")
+    results = retrieve_top_k(user_emb, db, k=3)
+
+    # 5. Print results to console
     print("\n[RESULTS]")
-    for i, (rid, m, score) in enumerate(results, 1):
-        title  = m.get("artwork_title_en") or m.get("title") or "Untitled"
-        artist = m.get("artist_name_en")   or m.get("artistDisplayName") or "Unknown"
-        year   = m.get("year")             or m.get("objectDate") or "?"
-        lic    = m.get("license") or ("Public Domain" if m.get("isPublicDomain") else "?")
-        path   = m.get("image_path") or "-"
-        print(f"{i:02d}. {title} — {artist} ({year}) | License: {lic} | Score={score:.3f} | {path}")
+    for item in results:
+        print(f"{item['rank']}. {item['artist']} — {item['title']} ({item['year']})")
+        print(f"   Similarity score: {item['score']:.4f}")
+        print(f"   Pose reading: {item['notes_pose']}")
+        print(f"   Image file: data/images/{item['file_name']}")
+        print()
 
-    # 5) optionally show first match (requires matplotlib)
-    try:
-        import matplotlib.pyplot as plt
-        from matplotlib import gridspec
-        import cv2
-
-        top_path = results[0][1].get("image_path")
-        if top_path and Path(top_path).exists():
-            ref_bgr = cv2.imread(top_path)
-            ref_rgb = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2RGB)
-
-            fig = plt.figure(figsize=(10, 5))
-            gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1])
-
-            ax0 = plt.subplot(gs[0]); ax0.imshow(img); ax0.set_title("Input"); ax0.axis("off")
-            ax1 = plt.subplot(gs[1]); ax1.imshow(ref_rgb); ax1.set_title("Top Match"); ax1.axis("off")
-
-            plt.tight_layout(); plt.show()
-    except Exception:
-        pass
+    print("✅ Test pipeline completed successfully.")
 
 
 if __name__ == "__main__":
