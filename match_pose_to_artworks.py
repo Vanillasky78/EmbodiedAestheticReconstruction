@@ -1,176 +1,227 @@
-"""
-match_pose_to_artworks.py
-----------------------------------------
-Full pipeline for pose-to-portrait retrieval.
+# match_pose_to_artworks.py
+# ------------------------------------------------------------
+# End-to-end helper to:
+# 1) Capture a still frame from camera (3s stillness).
+# 2) Search the curated portrait index (FAISS) using the same
+#    multi-cue matcher as the Streamlit app (CLIP + Pose + Color).
+# 3) Return the top-K results and useful paths for UI rendering.
+#
+# Usage (CLI test):
+#   python match_pose_to_artworks.py --topk 6 --no-public-domain
+#
+# Usage (from app.py):
+#   from match_pose_to_artworks import run_full_capture_and_match
+#   result = run_full_capture_and_match(topk=12, require_public_domain=True)
+#
+# Output (dict):
+# {
+#   "locked_frame_path": "data/interim/locked_frame.jpg",
+#   "results": [
+#       {"rid": "...", "score": 0.812, "meta": {...}, "image_path": "..."},
+#       ...
+#   ],
+#   "device": "mps/cuda/cpu",
+#   "index_info": {"n_items": int}
+# }
 
-Flow:
-1. Live camera feed watches the participant.
-2. When the participant holds a pose (low movement) for ~3 seconds,
-   the system "locks" that frame.
-3. We extract body keypoints using YOLOv8-Pose and render a clean
-   skeleton image (black background, white joints/limbs).
-4. We encode that skeleton image using OpenCLIP to get a pose embedding.
-5. We compare that embedding to the reference portrait dataset
-   (20 curated artworks) and return the Top-3 closest matches.
+from __future__ import annotations
 
-This script is intended to be called in installation mode
-or imported by a Streamlit app for display.
-"""
-
+import argparse
+import json
 import os
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
 import numpy as np
-import torch
 from PIL import Image
 
+# ML + ANN
+import torch
+import open_clip
+import faiss
+
+# local utils
 from processors.camera import capture_locked_frame
-from processors.pose import PoseEstimator, make_pose_detector
-from processors.retrieval import ArtworkDatabase
-from open_clip import create_model_and_transforms
+from processors.retrieval import Matcher
+
+# --------------------------
+# Paths (keep consistent with app.py / indexing)
+# --------------------------
+INDEX_DIR  = Path("indexing")
+INDEX_PATH = INDEX_DIR / "faiss.index"
+IDS_PATH   = INDEX_DIR / "ids.npy"
+META_PATH  = INDEX_DIR / "meta.json"
+
+INTERIM_DIR = Path("data") / "interim"
+INTERIM_DIR.mkdir(parents=True, exist_ok=True)
+LOCKED_FRAME = INTERIM_DIR / "locked_frame.jpg"
 
 
-# ---------------------------
-# 1. Configuration
-# ---------------------------
+# --------------------------
+# Lazy-load CLIP + FAISS
+# (与 app.py 同步，避免重复代码差异)
+# --------------------------
+def _load_matcher() -> Tuple[Matcher, str, Dict[str, int]]:
+    """Load CLIP model + FAISS index + metadata, return a ready Matcher and device."""
+    device = "cuda" if torch.cuda.is_available() else (
+             "mps"  if torch.backends.mps.is_available() else "cpu")
 
-CSV_PATH = "data/portrait_works.csv"
-RAW_SAVE_DIR = "data/interim/raw_frames"
-POSE_SAVE_DIR = "data/interim/pose_frames"
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32", pretrained="openai"
+    )
+    model.eval().to(device)
 
-MODEL_NAME = "ViT-B-32"
-PRETRAINED = "openai"
+    # 必要文件检查
+    missing = [p for p in (INDEX_PATH, IDS_PATH, META_PATH) if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Index not found. Please build it first:\n"
+            "  python indexing/build_index.py \\\n"
+            "    --dataset_jsonl data/interim/portrait_art_dataset.jsonl \\\n"
+            "    --images_dir    data/images\n"
+            f"Missing: {', '.join(str(p) for p in missing)}"
+        )
 
-DEVICE = "cuda" if torch.cuda.is_available() else (
-    "mps" if torch.backends.mps.is_available() else "cpu"
-)
+    # 载入 FAISS + 元数据
+    index = faiss.read_index(str(INDEX_PATH))
+    ids   = np.load(str(IDS_PATH), allow_pickle=True)
+    meta  = json.loads(META_PATH.read_text(encoding="utf-8"))
+
+    if len(ids) != len(meta):
+        # 不致命，给个提醒
+        print(f"[warn] Index/meta length mismatch: ids={len(ids)} meta={len(meta)}")
+
+    matcher = Matcher(index, ids, meta, model, preprocess, device=device)
+    info = {"n_items": int(index.ntotal)}
+    return matcher, device, info
 
 
-def encode_image_with_clip(img_path, clip_model, preprocess, device):
+# --------------------------
+# Public API
+# --------------------------
+def run_full_capture_and_match(
+    topk: int = 12,
+    require_public_domain: bool = True,
+    w_clip: float = 0.60,
+    w_pose: float = 0.30,
+    w_color: float = 0.10,
+    k_search: int = 200,
+    save_locked_frame_to: Path | str = LOCKED_FRAME,
+) -> Dict[str, Any]:
     """
-    Load an image, preprocess it for OpenCLIP, and return
-    a normalized embedding as a NumPy vector.
-    """
-    img = Image.open(img_path).convert("RGB")
-    img_tensor = preprocess(img).unsqueeze(0).to(device)
+    抓拍 → 检索 的一站式流程。
 
-    with torch.no_grad():
-        emb = clip_model.encode_image(img_tensor)
-        emb /= emb.norm(dim=-1, keepdim=True)
+    Parameters
+    ----------
+    topk : int
+        返回的前 K 个结果（UI 展示数量）
+    require_public_domain : bool
+        是否只返回 Public Domain / CC0
+    w_clip, w_pose, w_color : float
+        三种相似度的权重（与 app.py 的侧边栏一致）
+    k_search : int
+        FAISS 初筛取多少个候选后再综合重排
+    save_locked_frame_to : Path | str
+        抓取的静止帧保存路径
 
-    return emb.cpu().numpy().reshape(-1)  # (D,)
-
-
-def run_full_capture_and_match():
-    """
-    Run the full pipeline once:
-    - wait for subject to hold still
-    - capture frame
-    - generate skeleton
-    - encode pose
-    - retrieve Top-3 artworks
-
-    Returns:
+    Returns
+    -------
+    dict:
         {
-            "locked_frame_path": str,
-            "skeleton_path": str,
-            "results": [ {rank, artist, title, year, score, notes_pose, file_name}, ... ]
+          "locked_frame_path": <str>,
+          "results": [{"rid":..., "score":..., "meta":{...}, "image_path":...}, ...],
+          "device": <"cuda"/"mps"/"cpu">,
+          "index_info": {"n_items": int}
         }
     """
+    save_locked_frame_to = Path(save_locked_frame_to)
+    save_locked_frame_to.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"🔥 Using device: {DEVICE}")
+    # 1) 摄像头抓帧（已内置：自动轮询 0/1/2/3、3s 静止检测、失败会抛异常）
+    locked_frame_path = capture_locked_frame(out_path=str(save_locked_frame_to))
 
-    # ---------------------------
-    # 2. Init models
-    # ---------------------------
-    print("Initializing pose estimator (YOLOv8-Pose)...")
-    pose_estimator = PoseEstimator(device=DEVICE)
-    pose_detector = make_pose_detector(pose_estimator)
+    # 2) 载入检索器（CLIP + FAISS + metadata）
+    matcher, device, index_info = _load_matcher()
 
-    print("Initializing OpenCLIP model...")
-    clip_model, preprocess, _ = create_model_and_transforms(
-        MODEL_NAME,
-        pretrained=PRETRAINED
-    )
-    clip_model = clip_model.to(DEVICE)
-    clip_model.eval()
-
-    print("Loading portrait artwork database...")
-    db = ArtworkDatabase(csv_path=CSV_PATH)
-
-    # ---------------------------
-    # 3. Camera: wait for stillness
-    # ---------------------------
-    print("\n📷 Camera is live.")
-    print("Please hold your pose (very still) for about 3 seconds.\n")
-
-    locked_frame_path = capture_locked_frame(
-        pose_detector=pose_detector,
-        save_dir=RAW_SAVE_DIR,
-        stable_seconds=3.0,
-        movement_threshold=5.0,
-        camera_index=0,
-        show_debug_window=False  # set True while developing
+    # 3) 读取图片 → 做多模态检索
+    q_img = Image.open(locked_frame_path).convert("RGB")
+    weights = dict(w_clip=w_clip, w_pose=w_pose, w_color=w_color)
+    results = matcher.search(
+        q_img,
+        k=k_search,
+        weights=weights,
+        filters={"require_public_domain": require_public_domain},
+        topn=topk,
     )
 
-    print(f"✅ Captured locked frame: {locked_frame_path}")
+    # 4) 组装更易用的结构（供 UI 渲染）
+    packed: List[Dict[str, Any]] = []
+    for rid, meta, score in results:
+        # meta 中常见键：artwork_title_en/artist_name_en/year/museum/license/image_path ...
+        packed.append(
+            {
+                "rid": str(rid),
+                "score": float(score),
+                "meta": meta,
+                "image_path": meta.get("image_path"),
+            }
+        )
 
-    # ---------------------------
-    # 4. Create skeleton pose image from locked frame
-    # ---------------------------
-    # derive a timestamp-like suffix for naming
-    base_name = os.path.splitext(os.path.basename(locked_frame_path))[0]
-    skeleton_path = os.path.join(
-        POSE_SAVE_DIR,
-        f"{base_name}_skeleton.png"
-    )
-
-    # load frame as RGB array for pose processing
-    frame_rgb = np.array(Image.open(locked_frame_path).convert("RGB"))
-
-    keypoints = pose_estimator.extract_keypoints(frame_rgb)
-    if keypoints is None:
-        raise RuntimeError("No person detected in the locked frame. Cannot continue.")
-
-    pose_estimator.draw_skeleton_image(
-        frame_bgr=frame_rgb[:, :, ::-1],  # convert RGB to BGR for drawing consistency
-        keypoints=keypoints,
-        save_path=skeleton_path
-    )
-    print(f"✅ Saved skeleton pose image: {skeleton_path}")
-
-    # ---------------------------
-    # 5. Encode participant pose as embedding
-    # ---------------------------
-    print("Encoding participant pose with OpenCLIP...")
-    user_embedding = encode_image_with_clip(
-        img_path=skeleton_path,
-        clip_model=clip_model,
-        preprocess=preprocess,
-        device=DEVICE
-    )
-
-    # ---------------------------
-    # 6. Retrieve Top-3 closest artworks
-    # ---------------------------
-    print("Retrieving Top-3 portrait matches...")
-    results = db.retrieve_top_k(user_embedding, k=3)
-
-    print("\n🎯 Top matches:\n")
-    for item in results:
-        print(f"{item['rank']}. {item['artist']} — {item['title']} ({item['year']})")
-        print(f"   Similarity score: {item['score']:.4f}")
-        print(f"   Pose reading: {item['notes_pose']}")
-        print()
-
-    # ---------------------------
-    # 7. Return structured result (for Streamlit / UI layer)
-    # ---------------------------
     return {
-        "locked_frame_path": locked_frame_path,
-        "skeleton_path": skeleton_path,
-        "results": results
+        "locked_frame_path": str(locked_frame_path),
+        "results": packed,
+        "device": device,
+        "index_info": index_info,
     }
 
 
+# --------------------------
+# CLI for quick manual test
+# --------------------------
+def _build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Capture from camera and match against portrait index."
+    )
+    p.add_argument("--topk", type=int, default=6, help="How many results to return.")
+    p.add_argument(
+        "--no-public-domain",
+        action="store_true",
+        help="If set, do NOT require Public Domain/CC0.",
+    )
+    p.add_argument("--w-clip", type=float, default=0.60)
+    p.add_argument("--w-pose", type=float, default=0.30)
+    p.add_argument("--w-color", type=float, default=0.10)
+    p.add_argument("--k-search", type=int, default=200)
+    p.add_argument(
+        "--save-to", type=str, default=str(LOCKED_FRAME),
+        help="Locked frame output path."
+    )
+    return p
+
+
+def main():
+    args = _build_argparser().parse_args()
+    out = run_full_capture_and_match(
+        topk=args.topk,
+        require_public_domain=(not args.no_public_domain),
+        w_clip=args.w_clip,
+        w_pose=args.w_pose,
+        w_color=args.w_color,
+        k_search=args.k_search,
+        save_locked_frame_to=args.save_to,
+    )
+
+    print(f"\n[ok] Locked frame saved to: {out['locked_frame_path']}")
+    print(f"[ok] Device: {out['device']} | Index items: {out['index_info']['n_items']}")
+    print(f"[ok] Top-{len(out['results'])} results:")
+    for i, r in enumerate(out["results"], 1):
+        meta = r["meta"]
+        title  = meta.get("artwork_title_en") or meta.get("title") or "Untitled"
+        artist = meta.get("artist_name_en") or meta.get("artistDisplayName") or "Unknown"
+        year   = meta.get("year") or meta.get("objectDate") or "?"
+        museum = meta.get("museum") or meta.get("department") or ""
+        print(f"  {i:>2}. {title} — {artist} • {year} • {museum} | score={r['score']:.3f}")
+
+
 if __name__ == "__main__":
-    output = run_full_capture_and_match()
-    print("Done.")
+    main()
