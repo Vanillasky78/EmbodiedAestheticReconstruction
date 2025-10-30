@@ -1,152 +1,199 @@
-"""
-processors/camera.py
-----------------------------------------
-Camera loop that waits until the subject holds a pose
-(with very little movement) for a given duration
-(e.g. ~3 seconds), then captures and saves that frame.
+# processors/camera.py
+# -------------------------------------------------------------
+# Auto-detect camera (0/1/2/3), pick best resolution, and
+# capture a frame after N seconds of stillness.
+#
+# Public API:
+#   find_working_camera(indices=(0,1,2,3))
+#   capture_locked_frame(out_path: str, still_secs=3.0, ...)
+#
+# Notes (macOS permissions):
+#   If no camera opens, go to:
+#   System Settings → Privacy & Security → Camera
+#   and allow Terminal / VS Code / Safari (if used).
+# -------------------------------------------------------------
 
-This module does NOT draw skeletons. It only:
-- reads webcam frames,
-- checks motion using keypoints,
-- writes the "locked" RGB frame to disk,
-- returns the saved frame path.
-
-Requires:
-    pip install opencv-python numpy
-"""
-
-import os
-import cv2
+from __future__ import annotations
 import time
+from pathlib import Path
+from typing import Iterable, Optional, Tuple
+
+import cv2
 import numpy as np
-from datetime import datetime
 
 
-def _avg_keypoint_movement(kpts_prev, kpts_curr):
+# ---------- Low-level helpers ----------
+
+def _try_open(index: int, warmup_frames: int = 10) -> Optional[cv2.VideoCapture]:
+    """Try to open a camera device; return cv2.VideoCapture or None."""
+    cap = cv2.VideoCapture(index)
+    if not cap or not cap.isOpened():
+        if cap:
+            cap.release()
+        return None
+
+    # quick warmup to stabilize exposure/white balance
+    for _ in range(warmup_frames):
+        ok, _ = cap.read()
+        if not ok:
+            cap.release()
+            return None
+    return cap
+
+
+def _set_best_resolution(cap: cv2.VideoCapture, candidates: Iterable[Tuple[int, int]] = ((1920,1080),(1280,720),(960,540),(640,480))) -> Tuple[int,int]:
+    """Try to set the best (highest) working resolution; return (w, h) actually set."""
+    chosen = (0, 0)
+    for w, h in candidates:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  float(w))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(h))
+        rw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        rh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if rw == w and rh == h:
+            chosen = (rw, rh)
+            break
+        # keep last successful (may be 0,0 initially)
+        if rw*rh > chosen[0]*chosen[1]:
+            chosen = (rw, rh)
+    return chosen
+
+
+# ---------- Public: camera discovery ----------
+
+def find_working_camera(indices: Iterable[int] = (0, 1, 2, 3)) -> Tuple[int, cv2.VideoCapture]:
     """
-    Compute average Euclidean distance between previous keypoints and current keypoints.
-    Returns a float (pixels). Lower = more stable.
-    If we don't have both sets, return a large value so it's considered "not stable".
+    Try a list of indices and return (index, cap) for the first working device.
+    Raises RuntimeError if none opens.
     """
-    if kpts_prev is None or kpts_curr is None:
-        return 1e9  # force "not stable" at start
+    last_err = None
+    for idx in indices:
+        cap = _try_open(idx)
+        if cap is not None:
+            _set_best_resolution(cap)
+            return idx, cap
+        last_err = idx
 
-    diffs = []
-    for a, b in zip(kpts_prev, kpts_curr):
-        if a is None or b is None:
-            continue
-        ax, ay = a
-        bx, by = b
-        diffs.append(np.linalg.norm(np.array([ax, ay]) - np.array([bx, by])))
+    raise RuntimeError(
+        "Could not open camera on indices {}.\n"
+        "• On macOS, check System Settings → Privacy & Security → Camera and allow Terminal/VS Code/Safari.\n"
+        "• If you use an external USB camera, plug it in and retry.\n"
+        "• You may also try a different index manually (e.g., 1).".format(list(indices))
+    )
 
-    if len(diffs) == 0:
-        return 1e9
 
-    return float(sum(diffs) / len(diffs))
-
+# ---------- Public: stillness-based capture ----------
 
 def capture_locked_frame(
-    pose_detector,
-    save_dir="data/interim/raw_frames",
-    stable_seconds=3.0,
-    movement_threshold=5.0,
-    camera_index=0,
-    show_debug_window=False
-):
+    out_path: str = "data/interim/locked_frame.jpg",
+    still_secs: float = 3.0,
+    sample_hz: float = 10.0,
+    motion_thresh: float = 2.0,   # smaller = more sensitive to motion
+    blur_ksize: int = 5,
+    indices_to_try: Iterable[int] = (0, 1, 2, 3),
+    show_debug_window: bool = False,
+) -> str:
     """
-    Continuously read frames from webcam.
-    Use `pose_detector(frame_bgr)` to get body keypoints for the first person.
-    Track how much those keypoints move from frame to frame.
-    When movement stays below `movement_threshold` pixels
-    for at least `stable_seconds` seconds,
-    save that frame as the "locked frame" and return its path.
+    Open a camera (auto-detect), wait until scene is still for `still_secs`,
+    save a frame to `out_path`, and return the path.
 
-    Arguments:
-        pose_detector: function(frame_bgr) -> list[(x,y), ...] or None
-        save_dir: where to store the captured frame
-        stable_seconds: how long the subject must stay still
-        movement_threshold: how little they have to move (pixels avg)
-        camera_index: which webcam to open (0 = default)
-        show_debug_window: if True, show live feed with text overlay
-                           (useful for development, not for installation)
+    Heuristic:
+      - Compute per-frame grayscale absdiff.
+      - Use mean absolute difference as motion score.
+      - When score stays below `motion_thresh` for `still_secs`, capture.
 
-    Returns:
-        locked_path (str): path to the saved frame
+    Parameters
+    ----------
+    out_path : str
+        Output JPEG path to save.
+    still_secs : float
+        Required continuous stillness duration.
+    sample_hz : float
+        Processing frequency (read every 1/sample_hz seconds).
+    motion_thresh : float
+        Motion score threshold (0~255). Typical 1~4 works well.
+    blur_ksize : int
+        Gaussian blur kernel size to suppress noise before diff.
+    indices_to_try : Iterable[int]
+        Camera indices to try in order (default 0,1,2,3).
+    show_debug_window : bool
+        If True, pops an OpenCV window with live motion score (for local debug).
+
+    Returns
+    -------
+    str
+        Saved image path.
+
+    Raises
+    ------
+    RuntimeError
+        If camera cannot be opened.
     """
+    # ensure output dir
+    out_path = str(out_path)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-    os.makedirs(save_dir, exist_ok=True)
+    cam_idx, cap = find_working_camera(indices_to_try)
 
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open camera.")
+    # optional: display which camera we picked
+    print(f"[camera] Using device index: {cam_idx}  @ {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
 
-    prev_keypoints = None
-    stable_start_time = None
-    locked_path = None
+    prev_gray = None
+    still_start: Optional[float] = None
+    period = 1.0 / max(1e-6, sample_hz)
 
     try:
         while True:
-            ok, frame_bgr = cap.read()
-            if not ok:
-                continue
+            t0 = time.time()
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise RuntimeError("Failed to read from camera.")
 
-            # Get keypoints for current frame
-            curr_keypoints = pose_detector(frame_bgr)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if blur_ksize > 1:
+                gray = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
 
-            # Compute movement
-            movement = _avg_keypoint_movement(prev_keypoints, curr_keypoints)
+            motion_score = 0.0
+            if prev_gray is not None:
+                diff = cv2.absdiff(gray, prev_gray)
+                motion_score = float(np.mean(diff))
+            prev_gray = gray
 
-            # Check stability
-            is_still = movement < movement_threshold
-
-            if is_still:
-                # start timing if we just became still
-                if stable_start_time is None:
-                    stable_start_time = time.time()
-                elapsed = time.time() - stable_start_time
+            # check stillness timeline
+            if motion_score <= motion_thresh:
+                still_start = still_start or time.time()
             else:
-                # reset timer
-                stable_start_time = None
-                elapsed = 0.0
+                still_start = None
 
-            # Optional preview window for debugging
             if show_debug_window:
-                debug_frame = frame_bgr.copy()
-                text = (
-                    f"movement={movement:.2f} px | "
-                    f"still_for={elapsed:.1f}s / {stable_seconds:.1f}s"
-                )
-                color = (0, 255, 0) if is_still else (0, 0, 255)
-                cv2.putText(
-                    debug_frame,
-                    text,
-                    (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    color,
-                    2,
-                    cv2.LINE_AA
-                )
-                cv2.imshow("live", debug_frame)
-                # ESC to break in dev mode
-                if cv2.waitKey(1) == 27:
-                    break
+                vis = frame.copy()
+                cv2.putText(vis, f"motion={motion_score:.2f}", (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+                if still_start:
+                    elapsed = time.time() - still_start
+                    cv2.putText(vis, f"still {elapsed:.1f}/{still_secs:.1f}s", (12, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,200,255), 2)
+                cv2.imshow("EAR Camera (debug)", vis)
+                # Allow ESC to abort
+                if (cv2.waitKey(1) & 0xFF) == 27:
+                    raise KeyboardInterrupt
 
-            # If we have stayed still long enough → lock frame
-            if is_still and stable_start_time is not None:
-                if elapsed >= stable_seconds:
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    locked_path = os.path.join(save_dir, f"user_frame_{ts}.png")
-                    cv2.imwrite(locked_path, frame_bgr)
-                    break
+            if still_start and (time.time() - still_start) >= still_secs:
+                # capture!
+                ok = cv2.imwrite(out_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                if not ok:
+                    raise RuntimeError(f"Failed to write image: {out_path}")
+                return out_path
 
-            prev_keypoints = curr_keypoints
+            # throttle loop
+            dt = time.time() - t0
+            if dt < period:
+                time.sleep(period - dt)
 
     finally:
-        cap.release()
+        try:
+            cap.release()
+        except Exception:
+            pass
         if show_debug_window:
-            cv2.destroyAllWindows()
-
-    if locked_path is None:
-        raise RuntimeError("No locked frame was captured.")
-    return locked_path
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
