@@ -1,30 +1,23 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-indexing/build_index.py
-Usage:
-  python indexing/build_index.py \
-    --dataset_jsonl data/interim/portrait_art_dataset.jsonl \
-    --images_dir data/images \
-    --out_dir indexing
-"""
-
-import argparse, json, os
-from pathlib import Path
-from typing import List, Dict
-
-import numpy as np
-import faiss
-from PIL import Image
+# indexing/build_index.py
+import os, json, argparse, sys, math, time
+from typing import List, Dict, Any
 
 import torch
-import open_clip
+import numpy as np
+from PIL import Image
+
+try:
+    import faiss                   # pip install faiss-cpu
+except Exception as e:
+    print("[ERR] faiss not available, please `pip install faiss-cpu`")
+    raise
+
+import open_clip                  # pip install open-clip-torch
 
 
-def load_jsonl(path: Path) -> List[Dict]:
+def load_rows(jsonl_path: str) -> List[Dict[str, Any]]:
     rows = []
-    with path.open("r", encoding="utf-8") as f:
+    with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -33,106 +26,149 @@ def load_jsonl(path: Path) -> List[Dict]:
     return rows
 
 
-def build_model(device: str = "cpu"):
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-B-32", pretrained="openai"
-    )
-    model.eval().to(device)
-    return model, preprocess
-
-
 @torch.no_grad()
-def encode_images(rows: List[Dict], images_dir: Path, model, preprocess, device: str):
-    """返回 (embeddings[N, D], ids[N], meta[N])"""
-    embs = []
-    ids = []
-    meta = []
+def encode_images(rows: List[Dict[str, Any]],
+                  images_dir: str,
+                  model,
+                  preprocess,
+                  device: str,
+                  save_pt_to: str = None) -> tuple:
+    """
+    Returns:
+        (embs: np.ndarray [N, D], ids: np.ndarray [N], meta: List[Dict]])
+    Also optionally saves per-image embeddings to path provided by each row['embedding_path'].
+    """
+    model.eval()
 
-    for r in rows:
-        # 兼容不同字段
-        rid = r.get("artwork_id") or r.get("objectID") or r.get("id")
-        img_rel = r.get("image_path")  # 如果 JSONL 已经写了本地路径
-        if not img_rel:
-            # 尝试用文件名或 id 猜测图片路径（可按你的命名规则再加几种）
-            # 例如：images/{artwork_id}.jpg
-            img_rel = f"{rid}.jpg"
+    all_embs: List[np.ndarray] = []
+    ids: List[int] = []
+    meta: List[Dict[str, Any]] = []
 
-        img_path = images_dir / img_rel
-        if not img_path.exists():
-            # 没图就跳过（也可以只做文字/其他来源嵌入，这里从简）
+    # base dir for saving per-image embeddings (so that "embeddings/xxx.pt" is under data/)
+    data_root = os.path.abspath(os.path.join(images_dir, os.pardir))
+
+    for idx, row in enumerate(rows, 1):
+        # robust get of file name
+        fname = row.get("file_name") or row.get("image") or row.get("path") or row.get("filename")
+        if not fname:
+            print(f"[WARN] line {idx}: no 'file_name' (or alias) key in row -> skipped")
+            continue
+
+        img_path = os.path.join(images_dir, fname)
+        if not os.path.isfile(img_path):
+            print(f"[WARN] missing image: {img_path} -> skipped")
             continue
 
         try:
-            img = Image.open(img_path).convert("RGB")
-            img_t = preprocess(img).unsqueeze(0).to(device)
-            feat = model.encode_image(img_t)
-            feat = feat / feat.norm(dim=-1, keepdim=True)
-            embs.append(feat.cpu().numpy())
-            ids.append(str(rid))
-            # 只保留渲染需要的关键字段
-            meta.append({
-                "artwork_id": str(rid),
-                "title": r.get("artwork_title_en") or r.get("title"),
-                "artist": r.get("artist_name_en") or r.get("artistDisplayName"),
-                "year": r.get("year") or r.get("objectDate"),
-                "museum": r.get("museum") or r.get("repository") or r.get("department"),
-                "license": r.get("license") or ("Public Domain" if r.get("isPublicDomain") else None),
-                "image_path": str(img_path),
-            })
+            image = Image.open(img_path).convert("RGB")
         except Exception as e:
-            print(f"[skip] {img_path}: {e}")
+            print(f"[WARN] failed to open: {img_path} -> {e}")
+            continue
 
-    if not embs:
-        raise RuntimeError("No embeddings created. Make sure images exist under --images_dir.")
+        image = preprocess(image).unsqueeze(0).to(device)
 
-    embs = np.vstack(embs).astype("float32")  # (N, D)
-    return embs, np.array(ids), meta
+        feat = model.encode_image(image)
+        # normalize to unit length (Inner Product index = cosine if normalized)
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+
+        emb_np = feat.cpu().numpy().astype("float32")  # faiss expects float32
+
+        # collect
+        all_embs.append(emb_np[0])
+        # id field fallback
+        _id = row.get("id")
+        if _id is None:
+            _id = len(ids) + 1
+        ids.append(int(_id))
+
+        # save per-image .pt if user provided embedding_path
+        epath = row.get("embedding_path")
+        if epath:
+            out_pt = os.path.join(data_root, epath) if not os.path.isabs(epath) else epath
+            os.makedirs(os.path.dirname(out_pt), exist_ok=True)
+            try:
+                torch.save(torch.from_numpy(emb_np), out_pt)
+            except Exception as e:
+                print(f"[WARN] failed to save embedding to {out_pt}: {e}")
+
+        # meta to help UI
+        meta.append({
+            "id": int(_id),
+            "file_name": fname,
+            "artist_en": row.get("artist_en"),
+            "title_en": row.get("title_en"),
+            "notes_pose": row.get("notes_pose"),
+            "year": row.get("year")
+        })
+
+    if len(all_embs) == 0:
+        raise RuntimeError("No embeddings created. Make sure images exist under --images_dir and JSONL has valid 'file_name'.")
+
+    embs = np.stack(all_embs, axis=0)
+    ids = np.asarray(ids, dtype=np.int64)
+    return embs, ids, meta
 
 
 def build_faiss(embs: np.ndarray):
     d = embs.shape[1]
-    index = faiss.IndexFlatIP(d)  # 余弦等价于内积(已单位化)
+    index = faiss.IndexFlatIP(d)             # inner-product
+    faiss.normalize_L2(embs)                  # safety: ensure already normalized
     index.add(embs)
     return index
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset_jsonl", type=str, required=True)
-    ap.add_argument("--images_dir", type=str, default="data/images")
-    ap.add_argument("--out_dir", type=str, default="indexing")
+    ap.add_argument("--dataset_jsonl", required=True, help="data/interim/portrait_art_dataset.jsonl")
+    ap.add_argument("--images_dir", required=True, help="data/images")
+    ap.add_argument("--out_dir", required=True, help="indexing")
+    ap.add_argument("--device", default="mps", choices=["cpu", "cuda", "mps"])
+    ap.add_argument("--model", default="ViT-B-32")
+    ap.add_argument("--pretrained", default="openai")
+    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    dataset_jsonl = Path(args.dataset_jsonl)
-    images_dir = Path(args.images_dir)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[device] {args.device}")
 
-    if not dataset_jsonl.exists():
-        raise FileNotFoundError(f"{dataset_jsonl} not found")
-    if not images_dir.exists():
-        print(f"[warn] images_dir {images_dir} not found. You may get 0 embeddings.")
+    if not os.path.isfile(args.dataset_jsonl):
+        raise FileNotFoundError(f"{args.dataset_jsonl} not found")
+    if not os.path.isdir(args.images_dir):
+        raise FileNotFoundError(f"{args.images_dir} not found")
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"[device] {device}")
-
-    rows = load_jsonl(dataset_jsonl)
+    rows = load_rows(args.dataset_jsonl)
     print(f"[data] rows: {len(rows)}")
 
-    model, preprocess = build_model(device=device)
-    embs, ids, meta = encode_images(rows, images_dir, model, preprocess, device)
+    # load model
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        args.model, pretrained=args.pretrained
+    )
+    model = model.to(args.device)
+
+    embs, ids, meta = encode_images(
+        rows=rows,
+        images_dir=args.images_dir,
+        model=model,
+        preprocess=preprocess,
+        device=args.device,
+    )
+
+    if args.verbose:
+        print(f"[embeddings] shape={embs.shape}, ids={ids.shape}")
 
     index = build_faiss(embs)
 
-    faiss_path = out_dir / "faiss.index"
-    ids_path   = out_dir / "ids.npy"
-    meta_path  = out_dir / "meta.json"
+    # save artifacts
+    faiss_path = os.path.join(args.out_dir, "faiss.index")
+    ids_path = os.path.join(args.out_dir, "ids.npy")
+    meta_path = os.path.join(args.out_dir, "meta.json")
 
-    faiss.write_index(index, str(faiss_path))
-    np.save(str(ids_path), ids, allow_pickle=True)
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    faiss.write_index(index, faiss_path)
+    np.save(ids_path, ids)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print(f"[ok] saved: {faiss_path}\n[ok] saved: {ids_path}\n[ok] saved: {meta_path}")
+    print(f"[OK] wrote:\n  {faiss_path}\n  {ids_path}\n  {meta_path}")
 
 
 if __name__ == "__main__":

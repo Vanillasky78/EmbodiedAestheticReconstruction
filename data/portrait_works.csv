@@ -8,14 +8,12 @@ id,artist_en,title_en,year,notes_pose,file_name,embedding_path
 7,Sir Joshua Reynolds,Portrait of Lady Bampfylde,1770s,"aristocratic composed posture, controlled elegance",Reynolds_LadyBampfylde.jpg,embeddings/Reynolds_LadyBampfylde.pt
 8,Arthur Hughes,Elaine with the Armour of Launcelot,1867,"romantic languor, draped body, narrative suffering",Hughes_Elaine_Launcelot.jpg,embeddings/Hughes_Elaine_Launcelot.pt
 9,James Tissot,Summer ('Portrait'),1876,"fashioned self-display, tailored posture",Tissot_Summer.jpg,embeddings/Tissot_Summer.pt
-10,James Tissot,The Singer,1870s,"performative presence, socially staged femininity",Tissot_TheSinger.jpg,embeddings/Tissot_TheSinger.pt
-11,George Clausen,Brown Eyes,1880s,"direct gaze, ordinary dignity",Clausen_BrownEyes.jpg,embeddings/Clausen_BrownEyes.pt
-12,George Clausen,Lady with a Dove (Madame Loeser),1880s,"gentle containment, arms drawn in",Clausen_LadyWithDove.jpg,embeddings/Clausen_LadyWithDove.pt
-13,Joanna Mary Wells,Gretchen,1850s–60s,"soft interior emotion, moral self-awareness",Wells_Gretchen.jpg,embeddings/Wells_Gretchen.pt
-14,Arthur Hughes,[Untitled / 1866 work],1866,(to fill),Hughes_1866.jpg,embeddings/Hughes_1866.pt
-15,John Brett,[Untitled / 1864 work],1864,(to fill),Brett_1864.jpg,embeddings/Brett_1864.pt
-16,Anselm Feuerbach,Nanna,1860s,"classical melancholy, lowered gaze",Feuerbach_Nanna.jpg,embeddings/Feuerbach_Nanna.pt
-17,Anselm Feuerbach,Portrait einer Venezianerin,1860s,"three-quarter turn, aristocratic sensual stillness",Feuerbach_Venezianerin.jpg,embeddings/Feuerbach_Venezianerin.pt
-18,Leonardo da Vinci,Ginevra de' Benci,c.1474,"frontal calm, withheld expression, alert intelligence",DaVinci_Ginevra.jpg,embeddings/DaVinci_Ginevra.pt
-19,Élisabeth Louise Vigée Le Brun,Lady Hamilton as the Cumaean Sibyl,1790s,"mythic self-staging, theatrical aura",VigeeLeBrun_Hamilton_Sibyl.jpg,embeddings/VigeeLeBrun_Hamilton_Sibyl.pt
-20,Élisabeth Louise Vigée Le Brun,Portrait of Countess Skavronskaia,1790s,"cultivated ease, social luxury",VigeeLeBrun_Skavronskaia.jpg,embeddings/VigeeLeBrun_Skavronskaia.pt
+10,George Clausen,Brown Eyes,1880s,"direct gaze, ordinary dignity",Clausen_BrownEyes.jpg,embeddings/Clausen_BrownEyes.pt
+11,George Clausen,Lady with a Dove (Madame Loeser),1880s,"gentle containment, arms drawn in",Clausen_LadyWithDove.jpg,embeddings/Clausen_LadyWithDove.pt
+12,Joanna Mary Wells,Gretchen,1850s–60s,"soft interior emotion, moral self-awareness",Wells_Gretchen.jpg,embeddings/Wells_Gretchen.pt
+13,Arthur Hughes,The Singer,1866,(to fill),"The Singer.jpg",embeddings/Hughes_1866.pt
+14,Anselm Feuerbach,Nanna,1860s,"classical melancholy, lowered gaze",Feuerbach_Nanna.jpg,embeddings/Feuerbach_Nanna.pt
+15,Anselm Feuerbach,Portrait einer Venezianerin,1860s,"three-quarter turn, aristocratic sensual stillness",Feuerbach_Venezianerin.jpg,embeddings/Feuerbach_Venezianerin.pt
+16,Leonardo da Vinci,Ginevra de' Benci,c.1474,"frontal calm, withheld expression, alert intelligence",DaVinci_Ginevra.jpg,embeddings/DaVinci_Ginevra.pt
+17,Élisabeth Louise Vigée Le Brun,Lady Hamilton as the Cumaean Sibyl,1790s,"mythic self-staging, theatrical aura",VigeeLeBrun_Hamilton_Sibyl.jpg,embeddings/VigeeLeBrun_Hamilton_Sibyl.pt
+18,Élisabeth Louise Vigée Le Brun,Portrait of Countess Skavronskaia,1790s,"cultivated ease, social luxury",VigeeLeBrun_Skavronskaia.jpg,embeddings/VigeeLeBrun_Skavronskaia.pt
