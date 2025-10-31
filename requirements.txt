@@ -1,21 +1,39 @@
-# Core numerical / ML
-torch
+# ============================================================
+# Embodied Aesthetic Reconstruction - Full Requirements
+# ============================================================
+
+# --- Core numerical / ML ---
+torch>=2.1.0
 torchvision
 torchaudio
 numpy
 pandas
 scikit-learn
+faiss-cpu            # For embedding indexing/search (FAISS)
+tqdm                 # Progress bars / CLI feedback
 
-# Pose estimation
-ultralytics
-opencv-python
+# --- Pose estimation ---
+ultralytics>=8.2.0   # YOLOv8-Pose
+opencv-python>=4.8.0
+# macOS MPS sometimes needs this:
+opencv-python-headless; sys_platform == "darwin"
 
-# CLIP-style embeddings
-open_clip_torch
-Pillow
+# --- CLIP / Image embeddings ---
+open_clip_torch>=2.24.0
+Pillow>=10.0.0
 
-# Web / UI layer (for app.py)
-streamlit
+# --- Web / UI layer (for app.py) ---
+streamlit>=1.36.0
+watchdog             # hot reload stability
 
-# Progress bars / nice CLI feedback (optional but helpful)
-tqdm
+# --- Optional visualization & debugging ---
+matplotlib
+seaborn
+plotly
+
+# --- JSON / YAML utilities ---
+pyyaml
+jsonlines
+
+# --- Safety fallback for macOS libomp issue ---
+# (used in run instructions: export KMP_DUPLICATE_LIB_OK=TRUE)

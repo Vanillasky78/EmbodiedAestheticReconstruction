@@ -1,0 +1,35 @@
+name: ear-mvp
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  # --- Core numerical / ML ---
+  - numpy
+  - pandas
+  - scikit-learn
+  - pillow
+
+  # --- PyTorch (with Apple Silicon MPS support) ---
+  - pytorch
+  - torchvision
+  - torchaudio
+
+  # --- Computer vision & indexing ---
+  - opencv
+  - faiss-cpu     # FAISS CPU version (stable on macOS)
+
+  # --- Web / UI ---
+  - streamlit
+
+  # --- Utilities ---
+  - tqdm
+  - pip
+
+  # --- Python packages via pip ---
+  - pip:
+      # YOLOv8 Pose estimation
+      - ultralytics
+      # OpenCLIP embeddings
+      - open_clip_torch
