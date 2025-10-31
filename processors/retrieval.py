@@ -1,60 +1,143 @@
 # processors/retrieval.py
 # ------------------------------------------------------------
-# A simple retrieval helper with a unified 'Matcher' API.
+# A retrieval helper with a unified 'Matcher' API.
 # - FAISS candidate retrieval by CLIP embedding
 # - Optional re-ranking with Pose and Color
-# - Graceful fallback if pose/color deps are not available
+# - Backward-compatible: accept either in-memory objects OR file paths
 
 from __future__ import annotations
+import json
+import os
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple, Optional
 
 import numpy as np
 from PIL import Image
 
 try:
-    import cv2  # for color histogram (optional)
+    import cv2  # optional: color histogram
     _HAS_CV2 = True
 except Exception:
     _HAS_CV2 = False
     cv2 = None  # type: ignore
 
-
 def _l2_normalize(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     n = np.linalg.norm(x, axis=-1, keepdims=True)
     return x / (n + eps)
 
+def _maybe_load_faiss(index_path: Optional[str]):
+    if not index_path:
+        return None
+    try:
+        import faiss  # type: ignore
+    except Exception as e:
+        raise RuntimeError("FAISS is required to load an index from file, but it's not available.") from e
+    if not Path(index_path).exists():
+        raise FileNotFoundError(f"FAISS index not found: {index_path}")
+    return faiss.read_index(index_path)
+
+def _maybe_autoload_clip(device: str):
+    """
+    Autoload a small OpenCLIP if model/preprocess are not provided.
+    Uses ViT-B-32 (openai) to ensure portability on CPU/MPS.
+    """
+    import torch
+    import open_clip
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32", pretrained="openai"
+    )
+    model.to(device)
+    model.eval()
+    return model, preprocess
 
 class Matcher:
     """
     A light wrapper used by app.py & match_pose_to_artworks.py
 
-    Parameters
-    ----------
-    index : faiss.Index
-        FAISS index built on CLIP image embeddings.
-    ids : np.ndarray
-        Array of record ids aligned with index rows.
-    meta : List[dict]
-        Metadata list aligned with ids (same length).
-    model : open_clip model
-        CLIP model (image encoder used).
-    preprocess : torchvision-like transform
-        Preprocess function to turn PIL into CLIP input.
-    device : str
-        "cuda" / "mps" / "cpu"
+    You can init it in TWO ways (both等价):
+
+    1) 传对象（原始用法，与你当前retrieval.py一致）
+       Matcher(index=faiss_index, ids=np_array, meta=list_of_dict, model=clip_model, preprocess=clip_preprocess, device="mps")
+
+    2) 传路径（与 app.py 的“faiss_index_path / ids_path / meta_path”参数名兼容）
+       Matcher(
+         faiss_index_path="indexing/faiss.index",
+         ids_path="indexing/ids.npy",
+         meta_path="indexing/meta.json",
+         images_dir="data/images",       # 用来补全 meta['image_path']
+         device="mps",                   # 可选；默认自动装载 OpenCLIP
+         autoload_model=True             # 不提供model/preprocess时，会自动加载 ViT-B-32(openai)
+       )
     """
 
     def __init__(
         self,
-        index: Any,
-        ids: np.ndarray,
-        meta: List[Dict[str, Any]],
-        model: Any,
-        preprocess: Any,
+        # --- 原始对象式 ---
+        index: Any = None,
+        ids: Optional[np.ndarray] = None,
+        meta: Optional[List[Dict[str, Any]]] = None,
+        model: Any = None,
+        preprocess: Any = None,
+
+        # --- 路径式（向后兼容 app.py 中的关键字）---
+        faiss_index_path: Optional[str] = None,
+        index_path: Optional[str] = None,      # 兼容别的命名
+        index_file: Optional[str] = None,      # 兼容别的命名
+        ids_path: Optional[str] = None,
+        ids_file: Optional[str] = None,        # 兼容别的命名
+        meta_path: Optional[str] = None,
+        meta_file: Optional[str] = None,       # 兼容别的命名
+        images_dir: Optional[str] = None,
+
+        # --- 其它 ---
         device: str = "cpu",
+        autoload_model: bool = True,
     ):
+        # ---- 选择性从路径加载 ----
+        # 兼容不同关键字：faiss_index_path / index_path / index_file
+        index_path_any = faiss_index_path or index_path or index_file
+        ids_path_any   = ids_path or ids_file
+        meta_path_any  = meta_path or meta_file
+
+        if index is None and (index_path_any is not None):
+            index = _maybe_load_faiss(index_path_any)
+
+        if ids is None and ids_path_any:
+            if not Path(ids_path_any).exists():
+                raise FileNotFoundError(f"ids not found: {ids_path_any}")
+            ids = np.load(ids_path_any)
+
+        if meta is None and meta_path_any:
+            if not Path(meta_path_any).exists():
+                raise FileNotFoundError(f"meta not found: {meta_path_any}")
+            with open(meta_path_any, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            # 补全 image_path
+            if images_dir:
+                for m in meta:
+                    # 若已有 image_path 则保留；否则用 file_name 拼出完整路径
+                    if not m.get("image_path"):
+                        fn = m.get("file_name") or m.get("filename")
+                        if fn:
+                            m["image_path"] = str(Path(images_dir) / fn)
+
+        # ---- 基本校验 ----
+        if index is None or ids is None or meta is None:
+            raise ValueError(
+                "[Matcher] Missing core components. "
+                "Provide (index, ids, meta) or the corresponding file paths."
+            )
+
+        # 若未提供模型与预处理，则按需自动加载
+        if model is None or preprocess is None:
+            if autoload_model:
+                model, preprocess = _maybe_autoload_clip(device)
+            else:
+                raise ValueError(
+                    "[Matcher] model/preprocess not provided and autoload_model=False."
+                )
+
         self.index = index
         self.ids = ids
         self.meta = meta
@@ -64,6 +147,7 @@ class Matcher:
 
         # id -> meta 映射，便于查元数据
         self._id2meta: Dict[str, Dict[str, Any]] = {}
+        # ids 可能是整型数组或字符串；统一为字符串索引
         for i, rid in enumerate(self.ids):
             self._id2meta[str(rid)] = self.meta[i]
 
@@ -149,8 +233,8 @@ class Matcher:
         self,
         q_img: Image.Image,
         k: int = 200,
-        weights: Dict[str, float] | None = None,
-        filters: Dict[str, Any] | None = None,
+        weights: Optional[Dict[str, float]] = None,
+        filters: Optional[Dict[str, Any]] = None,
         topn: int = 12,
     ) -> List[Tuple[str, Dict[str, Any], float]]:
         """
@@ -167,10 +251,10 @@ class Matcher:
 
         # 1) CLIP → FAISS 召回
         q = self._clip_embed_pil(q_img)  # (1,d)
-        D, I = self.index.search(q, k)   # distances are inner-product or L2-based (built time)
-        # FAISS 通常越小越好或越大越好取决于索引类型。这里把 D 线性归一后当成“相似度”
+        D, I = self.index.search(q, k)   # distances -> normalize into similarity
         d = D.reshape(-1)
-        # 归一：转成 0~1，相似度越大越好
+
+        # 归一：0~1，相似度越大越好（不同FAISS度量差异在此统一）
         if len(d) > 0:
             d_min, d_max = float(d.min()), float(d.max())
             if d_max > d_min:
@@ -198,18 +282,16 @@ class Matcher:
         if not cand:
             return []
 
-        # 3) 计算 pose/color 分数（只对候选做，避免太慢）
+        # 3) 计算 pose/color 分数
         final_items: List[Tuple[str, Dict[str, Any], float]] = []
         for rid, m, clip_s in cand:
-            pose_s = self._pose_score(q_img, m.get("image_path")) if w_pose > 0 else 0.0
-            color_s = self._color_hist_score(q_img, m.get("image_path")) if w_color > 0 else 0.0
-            # 归一化加权
+            img_path = m.get("image_path")
+            pose_s = self._pose_score(q_img, img_path) if w_pose > 0 else 0.0
+            color_s = self._color_hist_score(q_img, img_path) if w_color > 0 else 0.0
             score = (w_clip * clip_s + w_pose * pose_s + w_color * color_s) / w_sum
             final_items.append((rid, m, float(score)))
 
-        # 4) 排序 & 取前 topn
         final_items.sort(key=lambda x: x[2], reverse=True)
         return final_items[:topn]
-
 
 __all__ = ["Matcher"]
