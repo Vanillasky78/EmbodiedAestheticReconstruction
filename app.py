@@ -1,184 +1,174 @@
-# processors/pose.py
+# app.py — Embodied Aesthetic Reconstruction
 # ------------------------------------------------------------
-# Minimal, app-compatible pose module:
-# - make_pose_detector(model_path="yolov8n-pose.pt", device="auto")
-# - PoseEstimator.extract_keypoints_pil(pil_img, detector) -> np.ndarray | None
-# - draw_skeleton(image, keypoints) (optional helper)
-# If ultralytics YOLOv8-Pose isn't available, gracefully falls back to a Dummy.
+# A live interactive system that links your embodied presence to art history.
 # ------------------------------------------------------------
 
-from __future__ import annotations
+import streamlit as st
+import torch
+import time
 from pathlib import Path
-from typing import Any, Optional, Tuple, List
-
+from PIL import Image
 import numpy as np
-from PIL import Image, ImageDraw
 
-# Try to import ultralytics for YOLOv8-Pose
-_HAS_YOLO = False
-try:
-    from ultralytics import YOLO  # type: ignore
-    _HAS_YOLO = True
-except Exception:
-    _HAS_YOLO = False
+# --- internal modules ---
+from processors.pose import make_pose_detector, PoseEstimator, draw_skeleton
+from processors.retrieval import Matcher
+from processors.generate_embeddings import load_clip_model
 
+# --- basic config ---
+st.set_page_config(page_title="Embodied Aesthetic Reconstruction", layout="wide")
 
-# --------------------------- Detector wrappers ---------------------------
+# ------------------------------------------------------------
+# UI HEADER
+# ------------------------------------------------------------
+st.title("🪞 Embodied Aesthetic Reconstruction")
+st.caption("A live interactive system that links your embodied presence to art history.")
 
-class _DummyPose:
-    """Fallback detector that always returns no keypoints."""
-    def __init__(self) -> None:
-        pass
+# ------------------------------------------------------------
+# Sidebar — configuration controls
+# ------------------------------------------------------------
+st.sidebar.subheader("⚙️ Matching Weights")
+w_clip = st.sidebar.slider("CLIP weight", 0.0, 1.0, 1.0, 0.05)
+w_pose = st.sidebar.slider("Pose weight", 0.0, 1.0, 0.3, 0.05)
+w_color = st.sidebar.slider("Color weight", 0.0, 1.0, 0.2, 0.05)
 
-    def __call__(self, img_bgr: np.ndarray):
-        # mimic ultralytics outputs structure minimally
-        class _R:
-            keypoints = None
-        return [_R()]
+st.sidebar.subheader("🖼️ Filters")
+require_pd = st.sidebar.checkbox("Require Public-Domain license", False)
+topk = st.sidebar.slider("Top-K artworks", 1, 12, 6)
 
+# ------------------------------------------------------------
+# Device setup
+# ------------------------------------------------------------
+if torch.backends.mps.is_available():
+    DEVICE = "mps"
+elif torch.cuda.is_available():
+    DEVICE = "cuda"
+else:
+    DEVICE = "cpu"
 
-class _YOLOPose:
-    def __init__(self, model_path: str, device: str = "auto") -> None:
-        self.model = YOLO(model_path)
-        # ultralytics uses .to() via model for device when predicting; we pass device in predict
+st.sidebar.text(f"Active device: {DEVICE}")
 
-        # COCO order expected (ultralytics uses 17 kp COCO by default)
-        self.num_kp = 17
-        self.device = device
+# ------------------------------------------------------------
+# Load CLIP + FAISS index
+# ------------------------------------------------------------
+@st.cache_resource
+def load_system():
+    import faiss
+    import json
+    from processors.generate_embeddings import load_clip_model
 
-    def __call__(self, img_bgr: np.ndarray):
-        # ultralytics accepts numpy BGR/RGB; device forwarded via args
-        return self.model.predict(
-            source=img_bgr,
-            device=self.device if self.device != "auto" else None,
-            verbose=False,
-            stream=False,
-        )
+    # load model + preprocessor
+    model, preprocess = load_clip_model(device=DEVICE)
 
+    # load index and meta
+    index_path = Path("indexing/faiss.index")
+    ids_path = Path("indexing/ids.npy")
+    meta_path = Path("indexing/meta.json")
 
-def make_pose_detector(
-    model_path: Optional[str] = "yolov8n-pose.pt",
-    device: str = "auto",
-):
-    """
-    Create a pose detector. Signature is intentionally PARAM-OPTIONAL
-    so app.py / retrieval.py can call make_pose_detector() with no args.
+    index = faiss.read_index(str(index_path))
+    ids = np.load(ids_path)
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
 
-    If ultralytics is available and model exists, returns YOLO wrapper.
-    Otherwise returns a Dummy detector (no keypoints).
-    """
-    if _HAS_YOLO and model_path:
-        mp = Path(model_path)
-        if not mp.exists():
-            # also try relative to project root
-            alt = Path.cwd() / model_path
-            if alt.exists():
-                mp = alt
-        if mp.exists():
+    matcher = Matcher(index=index, ids=ids, meta=meta, model=model, preprocess=preprocess, device=DEVICE)
+    return matcher, model, preprocess
+
+matcher, model, preprocess = load_system()
+
+# ------------------------------------------------------------
+# Load pose model (YOLOv8-Pose)
+# ------------------------------------------------------------
+pose_model = make_pose_detector("yolov8n-pose.pt", device=DEVICE)
+
+# ------------------------------------------------------------
+# Live mirror setup
+# ------------------------------------------------------------
+st.subheader("🎥 Live Mirror + Pose (Auto-capture on stillness)")
+
+pose_conf = st.slider("Pose confidence threshold", 0.0, 1.0, 0.4, 0.05)
+mirror_preview = st.checkbox("Mirror preview", True)
+stillness_time = st.number_input("Stillness required (seconds)", min_value=1.0, max_value=10.0, value=5.0, step=0.5)
+motion_sensitivity = st.slider("Motion sensitivity (lower = more sensitive)", 0.5, 5.0, 2.0, 0.1)
+
+manual_save = st.button("📸 Save frame manually")
+
+# --- initialize camera ---
+camera = st.camera_input("Hold still for ~5 seconds to auto-capture", key="camera")
+
+# Persistent state
+if "last_frame" not in st.session_state:
+    st.session_state.last_frame = None
+if "last_change" not in st.session_state:
+    st.session_state.last_change = time.time()
+
+# ------------------------------------------------------------
+# Utility: detect stillness
+# ------------------------------------------------------------
+def is_still(curr, prev, threshold=motion_sensitivity):
+    if curr is None or prev is None:
+        return False
+    diff = np.mean(np.abs(np.array(curr).astype(float) - np.array(prev).astype(float)))
+    return diff < threshold * 5  # adjustable tolerance
+
+# ------------------------------------------------------------
+# Handle input frame
+# ------------------------------------------------------------
+if camera is not None:
+    frame = Image.open(camera)
+    frame_rgb = frame.convert("RGB")
+
+    # Draw skeleton overlay (mirror view)
+    keypoints = PoseEstimator.extract_keypoints_pil(frame_rgb, pose_model)
+    if keypoints is not None:
+        overlay = draw_skeleton(frame_rgb, keypoints)
+        if mirror_preview:
+            overlay = overlay.transpose(Image.FLIP_LEFT_RIGHT)
+        st.image(overlay, caption="Live pose mirror", use_container_width=True)
+    else:
+        st.image(frame_rgb, caption="Live feed", use_container_width=True)
+
+    # Auto-capture logic
+    last_frame = st.session_state.last_frame
+    still = is_still(frame_rgb, last_frame, threshold=motion_sensitivity)
+    now = time.time()
+
+    if still:
+        delta = now - st.session_state.last_change
+        st.info(f"STILL… | Δ={delta:.2f}s | threshold≈{stillness_time:.2f}")
+        if delta > stillness_time or manual_save:
+            out_path = Path("data/interim/locked_frame.jpg")
+            frame_rgb.save(out_path)
+            st.success(f"✅ Captured frame saved to {out_path}")
+            # Perform matching
             try:
-                return _YOLOPose(str(mp), device=device)
-            except Exception:
-                pass
-    # fallback
-    return _DummyPose()
+                st.subheader("🎨 Top matches")
+                q_img = Image.open(out_path).convert("RGB")
+                results = matcher.search(
+                    q_img,
+                    topn=topk,
+                    weights={"w_clip": w_clip, "w_pose": w_pose, "w_color": w_color},
+                    filters={"require_public_domain": require_pd},
+                )
+                if not results:
+                    st.warning("No matches found.")
+                else:
+                    cols = st.columns(min(3, len(results)))
+                    for i, (rid, meta, score) in enumerate(results):
+                        with cols[i % len(cols)]:
+                            if "image_path" in meta and Path(meta["image_path"]).exists():
+                                img = Image.open(meta["image_path"])
+                                st.image(img, caption=f"{meta.get('title_en', 'Untitled')} — {meta.get('artist_en', '')} ({score:.3f})")
+                            else:
+                                st.markdown(f"**{meta.get('title_en', 'Untitled')}**<br>{meta.get('artist_en', '')} ({score:.3f})", unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Search failed: {e}")
+            st.session_state.last_change = now  # reset timer
+    else:
+        st.info("MOVE… (motion detected)")
+        st.session_state.last_change = now
 
+    # Update reference
+    st.session_state.last_frame = frame_rgb
 
-# --------------------------- Keypoint extractor ---------------------------
-
-class PoseEstimator:
-    """
-    Static helpers to extract & normalize keypoints.
-    Returned format: np.ndarray of shape (17, 2) with coordinates normalized to [0,1]
-    relative to image width/height. If not found, return None.
-    """
-
-    @staticmethod
-    def _to_numpy(img: Image.Image) -> np.ndarray:
-        # PIL RGB -> BGR (ultralytics不强制，但我们统一BGR)
-        arr = np.array(img.convert("RGB"))
-        return arr[:, :, ::-1].copy()
-
-    @staticmethod
-    def extract_keypoints_pil(pil_img: Image.Image, detector: Any) -> Optional[np.ndarray]:
-        """
-        Returns 17x2 normalized keypoints or None.
-        """
-        if detector is None:
-            return None
-
-        img_bgr = PoseEstimator._to_numpy(pil_img)
-        try:
-            preds = detector(img_bgr)
-        except Exception:
-            return None
-
-        # ultralytics: list of Results; each has .keypoints with .data (n,17,3) (x,y,conf)
-        kp = None
-        if preds and hasattr(preds[0], "keypoints") and preds[0].keypoints is not None:
-            # pick the first person w/ highest confidence avg
-            data = preds[0].keypoints.data  # tensor [n, 17, 3]
-            try:
-                import torch  # local import
-                if isinstance(data, torch.Tensor):
-                    data = data.detach().cpu().numpy()
-            except Exception:
-                data = np.array(data)
-
-            if data.ndim == 3 and data.shape[1] >= 17:
-                # choose the instance with highest mean conf
-                conf_mean = data[:, :, 2].mean(axis=1)
-                idx = int(conf_mean.argmax())
-                xy = data[idx, :17, :2]  # (17,2)
-                kp = xy
-
-        if kp is None:
-            return None
-
-        # normalize to [0,1] by width/height
-        h, w = img_bgr.shape[:2]
-        if w <= 0 or h <= 0:
-            return None
-        kp_norm = kp.astype(np.float32)
-        kp_norm[:, 0] /= float(w)
-        kp_norm[:, 1] /= float(h)
-        return kp_norm  # (17,2)
-
-
-# --------------------------- Visualization (optional) ---------------------------
-
-_COCO_PAIRS: List[Tuple[int, int]] = [
-    (5, 7), (7, 9), (6, 8), (8, 10),  # arms
-    (11, 13), (13, 15), (12, 14), (14, 16),  # legs
-    (5, 6), (11, 12),  # shoulders & hips
-    (0, 5), (0, 6), (5, 11), (6, 12)  # torso-ish links
-]
-
-def draw_skeleton(pil_img: Image.Image, keypoints: np.ndarray, radius: int = 4) -> Image.Image:
-    """
-    Draw COCO skeleton onto a copy of the image. keypoints must be absolute pixel coords
-    or normalized (0~1). If normalized (<=1), will auto-scale by image size.
-    """
-    out = pil_img.convert("RGB").copy()
-    draw = ImageDraw.Draw(out)
-
-    w, h = out.size
-    pts = keypoints.copy().astype(float)
-    # auto-detect normalization
-    if pts.max() <= 1.0 + 1e-6:
-        pts[:, 0] *= w
-        pts[:, 1] *= h
-
-    # draw lines
-    for a, b in _COCO_PAIRS:
-        if a < len(pts) and b < len(pts):
-            ax, ay = pts[a]
-            bx, by = pts[b]
-            draw.line([(ax, ay), (bx, by)], width=3, fill=(0, 255, 0))
-
-    # draw joints
-    for x, y in pts:
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=(255, 0, 0))
-    return out
-
-
-__all__ = ["make_pose_detector", "PoseEstimator", "draw_skeleton"]
+else:
+    st.warning("📷 Please enable your camera to begin live matching.")
