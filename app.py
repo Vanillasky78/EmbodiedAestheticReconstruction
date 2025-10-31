@@ -1,127 +1,331 @@
+# app.py
+# Streamlit live mirror with YOLOv8 pose overlay + stillness auto-capture + artwork retrieval
+import os
 import time
+import json
+from pathlib import Path
+from typing import Tuple, Optional, List
+
+import cv2
 import numpy as np
-import os, cv2, av
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, WebRtcMode
-from processors.live_pose import LivePose
 
-st.markdown("### 🎥 Live Mirror + Pose (Auto-capture on stillness)")
+# =============== Optional: use your repository classes if available ===============
+# Retrieval matcher (FAISS + OpenCLIP) — expected in your repo
+try:
+    from processors.retrieval import Matcher  # ensure processors/retrieval.py defines class Matcher
+except Exception as e:
+    Matcher = None
+    _matcher_import_err = e
 
-# ---- 控件
+# ---------------- Pose detector via ultralytics YOLOv8-Pose ----------------
+def load_yolo_pose(model_path: str = "yolov8n-pose.pt"):
+    """
+    Lazy-load YOLOv8 pose model. Returns (model, last_error).
+    """
+    try:
+        from ultralytics import YOLO
+        if not os.path.exists(model_path):
+            # allow ultralytics to download default if not present
+            model = YOLO("yolov8n-pose.pt")
+        else:
+            model = YOLO(model_path)
+        return model, None
+    except Exception as e:
+        return None, e
+
+
+def draw_skeleton(frame: np.ndarray, keypoints: np.ndarray, conf: float = 0.4) -> np.ndarray:
+    """
+    Draw YOLOv8-pose skeleton on frame.
+    keypoints shape: (N, 17, 3) — (x, y, score)
+    """
+    vis = frame.copy()
+    if keypoints is None or len(keypoints) == 0:
+        return vis
+
+    # Common COCO pairs for 17-keypoint set (YOLOv8)
+    pairs = [
+        (5, 7), (7, 9),     # left arm
+        (6, 8), (8, 10),    # right arm
+        (11, 13), (13, 15), # left leg
+        (12, 14), (14, 16), # right leg
+        (5, 6), (11, 12),   # shoulders, hips
+        (5, 11), (6, 12)    # torso diagonals
+    ]
+    for person in keypoints:
+        pts = person[:, :2].astype(int)
+        scores = person[:, 2]
+        # joints
+        for i, (x, y) in enumerate(pts):
+            if scores[i] >= conf:
+                cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
+        # bones
+        for a, b in pairs:
+            if scores[a] >= conf and scores[b] >= conf:
+                xa, ya = pts[a]
+                xb, yb = pts[b]
+                cv2.line(vis, (int(xa), int(ya)), (int(xb), int(yb)), (255, 0, 0), 2)
+    return vis
+
+
+# ---------------- Camera device helpers ----------------
+def enumerate_devices(max_idx: int = 3) -> List[int]:
+    """
+    Try indices 0..max_idx to see which ones open successfully.
+    """
+    ok = []
+    for i in range(max_idx + 1):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            ok.append(i)
+            cap.release()
+    return ok
+
+
+# ---------------- Stillness detector ----------------
+class StillnessDetector:
+    """
+    Simple stillness by frame diff (lower=more sensitive).
+    If avg abs diff < threshold for 'require_s' seconds -> trigger capture.
+    """
+    def __init__(self, sensitivity: float = 2.0, require_s: float = 5.0):
+        # sensitivity slider (lower = 更敏感); map into pixel-diff threshold
+        # pick threshold ~ (sensitivity * 2.5)
+        self.threshold = max(0.5, sensitivity * 2.5)
+        self.require_s = max(0.5, require_s)
+        self.last_gray = None
+        self.ok_since = None
+
+    def update(self, frame_bgr: np.ndarray) -> Tuple[bool, float]:
+        """
+        Returns (is_still_now, diff_value)
+        """
+        g = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        g = cv2.GaussianBlur(g, (5, 5), 0)
+        if self.last_gray is None:
+            self.last_gray = g
+            self.ok_since = None
+            return False, 999.0
+
+        diff = cv2.absdiff(g, self.last_gray)
+        self.last_gray = g
+        val = float(np.mean(diff))
+
+        if val < self.threshold:
+            if self.ok_since is None:
+                self.ok_since = time.time()
+            if time.time() - self.ok_since >= self.require_s:
+                # satisfied
+                self.ok_since = None  # reset to avoid repeated triggers
+                return True, val
+        else:
+            self.ok_since = None
+
+        return False, val
+
+
+# ---------------- Persistence helpers ----------------
+def save_locked_frame(frame_bgr: np.ndarray, out_dir: str = "data/interim") -> Tuple[bool, Optional[str]]:
+    try:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        out_path = os.path.join(out_dir, "locked_frame.jpg")
+        ok = cv2.imwrite(out_path, frame_bgr)
+        return (ok, out_path if ok else None)
+    except Exception:
+        return False, None
+
+
+# ---------------- Retrieval display ----------------
+@st.cache_resource
+def _load_matcher_cached():
+    if Matcher is None:
+        raise RuntimeError(f"Cannot import Matcher: {_matcher_import_err}")
+    device = "mps"  # change to "cpu"/"cuda" if needed
+    idx_dir = "indexing"
+    return Matcher(
+        faiss_index_path=os.path.join(idx_dir, "faiss.index"),
+        ids_path=os.path.join(idx_dir, "ids.npy"),
+        meta_path=os.path.join(idx_dir, "meta.json"),
+        images_dir="data/images",
+        device=device,
+    )
+
+
+def run_and_show_matches(saved_path: str, top_k: int = 3):
+    st.subheader("🎨 Top matches")
+    try:
+        matcher = _load_matcher_cached()
+    except Exception as e:
+        st.error(f"Matcher init failed: {e}")
+        return
+
+    try:
+        results = matcher.search_file(saved_path, top_k=top_k)
+    except Exception as e:
+        st.error(f"Search failed: {e}")
+        return
+
+    if not results:
+        st.warning("No results returned.")
+        return
+
+    cols = st.columns(len(results))
+    for i, r in enumerate(results):
+        # tolerate different keys
+        fname = r.get("file_name") or r.get("image") or r.get("path")
+        score = r.get("score")
+        title = r.get("title_en") or r.get("title") or ""
+        artist = r.get("artist_en") or r.get("artist") or ""
+
+        img_path = os.path.join("data/images", fname) if fname and not os.path.isabs(fname) else fname
+        caption = f"#{i+1}  {artist} — *{title}*"
+        if score is not None:
+            caption += f"\nscore: {score:.3f}"
+        with cols[i]:
+            if img_path and os.path.exists(img_path):
+                st.image(img_path, use_container_width=True, caption=caption)
+            else:
+                st.write(caption)
+                st.info(f"Image not found: {img_path}")
+
+
+# ---------------- Streamlit UI ----------------
+st.set_page_config(page_title="Embodied Aesthetic Reconstruction", layout="wide")
+st.title("🪞 Live Mirror + Pose (Auto-capture on stillness)")
+
 with st.expander("Live settings", expanded=True):
-    conf = st.slider("Pose confidence", 0.05, 0.9, 0.4, 0.05)
-    mirror = st.checkbox("Mirror preview", value=True)
-    still_seconds = st.number_input("Stillness required (seconds)", 1.0, 10.0, 5.0, 0.5)  # 已改为 5s 默认
-    sensitivity = st.slider("Motion sensitivity (lower = 更敏感)", 0.5, 5.0, 2.0, 0.1)
-    manual_col = st.empty()
+    pose_conf = st.slider("Pose confidence", 0.1, 0.9, 0.40, 0.01)
+    mirror_preview = st.checkbox("Mirror preview", value=True)
+    still_seconds = st.number_input("Stillness required (seconds)", min_value=1.0, max_value=10.0, value=5.0, step=0.5)
+    sens = st.slider("Motion sensitivity (lower = 更敏感)", 0.5, 5.0, 2.0, 0.1)
 
-# ---- 状态
-if "live_pose" not in st.session_state:
-    st.session_state.live_pose = LivePose(yolo_weights="yolov8n-pose.pt", conf=conf)
-else:
-    st.session_state.live_pose.conf = conf
+    col_btn = st.columns(2)
+    with col_btn[0]:
+        manual = st.button("📸 Save frame (manual)")
+    with col_btn[1]:
+        topk = st.slider("Top-K to display", 1, 6, 3)
 
-# 供 stillness 检测使用的状态
-state = st.session_state
-state.prev_kps = state.get("prev_kps", None)          # 上一帧关键点
-state.last_move_ts = state.get("last_move_ts", time.time())
-state.last_saved_path = state.get("last_saved_path", None)
-state.auto_saved_flag = state.get("auto_saved_flag", False)
+# device selection
+avail = enumerate_devices(4)
+dev_idx = st.selectbox("Select camera device", options=avail if avail else [0], index=0, format_func=lambda x: f"Device {x}")
 
-RTC_CONFIGURATION = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+# preview area
+frame_area = st.empty()
+status_line = st.empty()
 
-def _overlay_progress(img: np.ndarray, remain: float, total: float):
-    """在画面底部绘制进度条 + 文本"""
-    h, w = img.shape[:2]
-    pad = 12
-    bar_w = int(w * 0.6)
-    bar_h = 10
-    x0 = (w - bar_w) // 2
-    y0 = h - pad - bar_h
-    # 背景槽
-    cv2.rectangle(img, (x0, y0), (x0 + bar_w, y0 + bar_h), (60, 60, 60), -1)
-    # 已静止时长
-    elapsed = max(0.0, total - max(0.0, remain))
-    frac = float(np.clip(elapsed / total, 0, 1))
-    cv2.rectangle(img, (x0, y0), (x0 + int(bar_w * frac), y0 + bar_h), (0, 200, 0), -1)
-    # 文本
-    txt = f"Hold still: {remain:.1f}s"
-    cv2.putText(img, txt, (x0, y0 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (10, 220, 10), 2, cv2.LINE_AA)
+# Session flags
+if "running" not in st.session_state:
+    st.session_state.running = False
+if "last_bgr" not in st.session_state:
+    st.session_state.last_bgr = None
 
-def _kps_motion(prev_kps, cur_kps, norm_scale):
-    """
-    计算关键点间的平均位移（归一化）。norm_scale 用画面对角线像素；sensitivity 越小越敏感。
-    只在两帧都有的关键点计算。
-    """
-    if prev_kps is None or cur_kps is None:
-        return None
-    mask = (prev_kps[:, 0] > 0) & (prev_kps[:, 1] > 0) & (cur_kps[:, 0] > 0) & (cur_kps[:, 1] > 0)
-    if mask.sum() < 4:
-        return None
-    d = np.linalg.norm(prev_kps[mask] - cur_kps[mask], axis=1).mean()
-    return d / (norm_scale + 1e-6)
+start_col, stop_col = st.columns(2)
+with start_col:
+    start = st.button("START", type="primary", disabled=st.session_state.running)
+with stop_col:
+    stop = st.button("STOP", disabled=not st.session_state.running)
 
-def _save_frame(bgr: np.ndarray, path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    cv2.imwrite(path, bgr)
-
-def _video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
-    bgr = frame.to_ndarray(format="bgr24")
-
-    # 姿态推理 + 骨骼绘制，拿到关键点
-    vis, cur_kps = state.live_pose.infer_and_draw(bgr, mirror=mirror, return_kps=True)
-
-    # 运动检测（基于关键点位移）
-    h, w = vis.shape[:2]
-    diag = float(np.hypot(h, w))  # 归一化尺度：画面对角线
-    motion = _kps_motion(state.prev_kps, cur_kps, norm_scale=diag)
-    now = time.time()
-
-    # 阈值：以 sensitivity 转换为“允许的归一化位移”
-    # sensitivity 越小阈值越小 -> 更容易判定为“在动”
-    motion_thresh = 0.002 * sensitivity  # 经验值：0.002 对应轻微抖动
-
-    if motion is None or motion > motion_thresh:
-        state.last_move_ts = now
-        state.auto_saved_flag = False  # 一旦动了，下次可再次触发抓拍
-
-    remain = max(0.0, still_seconds - (now - state.last_move_ts))
-    _overlay_progress(vis, remain, still_seconds)
-
-    # 满足静止 5s 自动抓拍
-    if remain <= 0 and (not state.auto_saved_flag):
-        save_path = "data/interim/locked_frame.jpg"
-        # 保存叠加骨骼的画面（镜像一致）
-        _save_frame(vis, save_path)
-        state.last_saved_path = save_path
-        state.auto_saved_flag = True
-        # 在画面上打个 “Saved!” 提示
-        cv2.putText(vis, "Saved!", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 240, 0), 3, cv2.LINE_AA)
-
-    state.prev_kps = cur_kps
-    return LivePose.avframe_from_bgr(vis)
-
-webrtc_ctx = webrtc_streamer(
-    key="live-pose-mirror-stillness",
-    mode=WebRtcMode.SENDRECV,
-    rtc_configuration=RTC_CONFIGURATION,
-    media_stream_constraints={"video": True, "audio": False},
-    video_frame_callback=_video_frame_callback,
-)
-
-# 手动保存按钮（可选）
-if manual_col.button("📸 Save frame (manual)"):
-    if webrtc_ctx and webrtc_ctx.video_receiver:
-        frame = webrtc_ctx.video_receiver.get_frame(timeout=2.0)
-        bgr = frame.to_ndarray(format="bgr24")
-        vis, _ = state.live_pose.infer_and_draw(bgr, mirror=mirror, return_kps=True)
-        save_path = "data/interim/locked_frame.jpg"
-        _save_frame(vis, save_path)
-        state.last_saved_path = save_path
-        st.success(f"Saved → {save_path}")
+# Manual save triggers retrieval
+if manual and st.session_state.last_bgr is not None:
+    ok, p = save_locked_frame(st.session_state.last_bgr)
+    if ok:
+        st.success(f"Saved: {p}")
+        run_and_show_matches(p, top_k=topk)
     else:
-        st.error("No video frame yet — please allow camera and wait a second.")
+        st.error("Save failed (no frame yet?)")
 
-# 保存结果提示
-if state.last_saved_path:
-    st.caption(f"Last saved: {state.last_saved_path}")
+if start:
+    st.session_state.running = True
+if stop:
+    st.session_state.running = False
+
+# Main loop
+if st.session_state.running:
+    # init camera
+    cap = cv2.VideoCapture(int(dev_idx))
+    if not cap.isOpened():
+        st.error(f"Could not open camera device {dev_idx}")
+        st.session_state.running = False
+    else:
+        # init pose
+        yolo, pose_err = load_yolo_pose("yolov8n-pose.pt")
+        if yolo is None:
+            st.warning(f"Pose not available: {pose_err}")
+
+        detector = StillnessDetector(sensitivity=sens, require_s=still_seconds)
+        fps_t0 = time.time()
+        frames = 0
+
+        # run loop
+        while st.session_state.running and cap.isOpened():
+            ok, frame = cap.read()
+            if not ok:
+                status_line.error("Capture failed.")
+                break
+
+            # mirror if chosen
+            if mirror_preview:
+                frame = cv2.flip(frame, 1)
+
+            draw = frame.copy()
+
+            # pose overlay
+            if yolo is not None:
+                try:
+                    # YOLOv8 inference — return keypoints
+                    res = yolo.predict(draw, verbose=False, conf=pose_conf)
+                    kps = None
+                    if res and len(res) > 0 and hasattr(res[0], "keypoints") and res[0].keypoints is not None:
+                        # ultralytics Keypoints object -> .xy and .xyn .conf
+                        # we want (N, 17, 3) : x,y,conf
+                        kp = res[0].keypoints
+                        xy = kp.xy[0].cpu().numpy() if hasattr(kp, "xy") else None
+                        confs = kp.conf[0].cpu().numpy() if hasattr(kp, "conf") and kp.conf is not None else None
+                        if xy is not None:
+                            if confs is None:
+                                confs = np.ones((xy.shape[0], 1), dtype=np.float32)
+                            kps = np.concatenate([xy, confs], axis=1).reshape(1, -1, 3)
+                    draw = draw_skeleton(draw, kps, conf=pose_conf)
+                except Exception as e:
+                    status_line.warning(f"Pose error: {e}")
+
+            st.session_state.last_bgr = frame.copy()
+
+            # stillness
+            is_still, diff_val = detector.update(frame)
+            msg = f"Δ={diff_val:.2f} | threshold≈{detector.threshold:.2f}"
+            if is_still:
+                ok, path = save_locked_frame(frame)
+                if ok:
+                    status_line.success(f"Auto-captured: {path}")
+                    run_and_show_matches(path, top_k=topk)
+                else:
+                    status_line.error("Auto-save failed.")
+
+            # FPS estimate
+            frames += 1
+            if frames % 10 == 0:
+                now = time.time()
+                fps = 10.0 / max(1e-6, (now - fps_t0))
+                fps_t0 = now
+                cv2.putText(draw, f"FPS: {fps:.1f}", (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
+                cv2.putText(draw, f"FPS: {fps:.1f}", (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+
+            # show
+            frame_area.image(cv2.cvtColor(draw, cv2.COLOR_BGR2RGB), use_container_width=True)
+            status_line.info(("STILL…" if detector.ok_since else "MOVE…") + "  |  " + msg)
+
+            # allow UI to breathe
+            # break quickly if STOP pressed
+            if not st.session_state.running:
+                break
+            # tiny sleep to avoid CPU 100%
+            time.sleep(0.01)
+
+        cap.release()
+        status_line.info("Camera released.")
+else:
+    # idle state: show placeholder
+    with frame_area.container():
+        st.caption("选择摄像头并点击 START 以启动实时镜像 + 骨骼叠加。")
