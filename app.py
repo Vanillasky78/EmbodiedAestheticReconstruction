@@ -1,18 +1,19 @@
 # app.py
 # Embodied Aesthetic Reconstruction — Streamlit App (M4 / macOS ready)
 # -------------------------------------------------------------------
-# - Robust path resolution (always finds data/images next to this file)
-# - Skips iCloud placeholder files (*.icloud)
-# - Upload or camera capture; optional skeleton overlay
-# - CLIP / Color / Pose tri-fusion with user-adjustable weights
-# - Public-Domain filter (if present in metadata)
-# - Auto-caching of models and dataset embeddings
-# - YOLO device mapping for Apple Silicon (mps) — no CUDA required on macOS
+# - CLIP + Pose + Color fusion with an additional "Significance" channel
+# - Significance score (0–100) + badges + "Learn more" link per artwork
+# - Public-Domain filter (via metadata)
+# - Robust path resolution and iCloud placeholder (.icloud) avoidance
+# - YOLO device mapping for Apple Silicon (mps) / CUDA / CPU
+# - Optional HuggingFace pull for YOLO weights (keeps repo clean)
+# - Ready checks + cached dataset embeddings in .clip_cache/
 # -------------------------------------------------------------------
 
 from __future__ import annotations
 import io
 import json
+import math
 import time
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -22,7 +23,7 @@ import pandas as pd
 from PIL import Image, ImageOps
 import streamlit as st
 
-# ---------- Torch / device ----------
+# -------------------- Torch / device --------------------
 try:
     import torch
     TORCH_OK = True
@@ -30,6 +31,7 @@ except Exception:
     TORCH_OK = False
 
 def get_device() -> str:
+    """Return 'mps' on Apple Silicon, 'cuda' on Nvidia, else 'cpu'."""
     if not TORCH_OK:
         return "cpu"
     try:
@@ -43,7 +45,7 @@ def get_device() -> str:
 
 DEVICE = get_device()
 
-# Torch perf (safe no-op if unsupported)
+# Small perf tweak on PyTorch (no-op if unsupported)
 if TORCH_OK:
     try:
         torch.set_float32_matmul_precision("medium")
@@ -53,12 +55,12 @@ if TORCH_OK:
 def yolo_device() -> str:
     """Map our torch device to Ultralytics' expected device string."""
     if DEVICE == "mps":
-        return "mps"      # Apple Silicon GPU via Metal
+        return "mps"      # Apple Silicon via Metal
     if DEVICE == "cuda":
         return "0"        # first CUDA GPU
     return "cpu"
 
-# ---------- Paths ----------
+# -------------------- Paths --------------------
 APP_DIR = Path(__file__).parent.resolve()
 DATA_DIR = APP_DIR / "data"
 IMAGES_DIR = DATA_DIR / "images"
@@ -68,16 +70,16 @@ CACHE_DIR.mkdir(exist_ok=True)
 INTERIM_DIR.mkdir(parents=True, exist_ok=True)
 METADATA_CSV = DATA_DIR / "portrait_works.csv"
 
-# ---------- UI config ----------
+# -------------------- UI config --------------------
 st.set_page_config(
     page_title="Embodied Aesthetic Reconstruction",
     page_icon="🖼️",
     layout="wide",
 )
 
-# ---------- Utilities ----------
+# -------------------- Utilities --------------------
 def is_icloud_placeholder(p: Path) -> bool:
-    # iCloud keeps placeholders like `file.jpg.icloud` (sometimes hidden)
+    # iCloud keeps placeholders like 'file.jpg.icloud' (not actually present on disk)
     return p.suffix == ".icloud" or p.name.endswith(".icloud")
 
 def load_image_safe(path: Path) -> Optional[Image.Image]:
@@ -101,12 +103,13 @@ def center_crop_long_edge(im: Image.Image, size: int = 512) -> Image.Image:
     im = im.crop((left, top, left + s, top + s))
     return im.resize((size, size), Image.BICUBIC)
 
-# ---------- Sidebar ----------
+# -------------------- Sidebar --------------------
 with st.sidebar:
     st.header("⚙️ Matching Weights")
     w_clip = st.slider("CLIP weight", 0.0, 1.0, 1.00, 0.05)
     w_pose = st.slider("Pose weight", 0.0, 1.0, 0.30, 0.05)
     w_color = st.slider("Color weight", 0.0, 1.0, 0.20, 0.05)
+    w_sig  = st.slider("Significance weight", 0.0, 1.0, 0.20, 0.05)
 
     st.markdown("---")
     st.header("🔎 Filters")
@@ -124,14 +127,27 @@ with st.sidebar:
     st.header("🧍 Overlay")
     overlay_skeleton = st.checkbox("Draw skeleton on preview (if available)", value=True)
 
-# ---------- Metadata & dataset ----------
+# -------------------- Metadata & dataset --------------------
 def load_metadata() -> pd.DataFrame:
+    """
+    Expected columns (any can be missing):
+    filename,title,artist,year,license,museum,accession,movement,
+    is_masterwork,citations,exhibitions,auction_price_usd,views_per_year,
+    notable_tags,source_links
+    """
     if METADATA_CSV.exists():
         try:
             return pd.read_csv(METADATA_CSV)
         except Exception as e:
             st.warning(f"Could not read metadata CSV ({METADATA_CSV.name}): {e}")
-    return pd.DataFrame({"filename": [], "title": [], "artist": [], "year": [], "license": []})
+    # Fallback minimal schema
+    return pd.DataFrame({
+        "filename": [], "title": [], "artist": [], "year": [], "license": [],
+        "museum": [], "accession": [], "movement": [],
+        "is_masterwork": [], "citations": [], "exhibitions": [],
+        "auction_price_usd": [], "views_per_year": [],
+        "notable_tags": [], "source_links": []
+    })
 
 META = load_metadata()
 
@@ -146,7 +162,65 @@ def list_dataset_images() -> List[Path]:
 
 DATASET_FILES = list_dataset_images()
 
-# ---------- OpenCLIP ----------
+# -------------------- Significance (0..100) --------------------
+TOP_MUSEUMS = ["met", "national gallery", "tate", "louvre", "uffizi", "hermitage", "ng london"]
+
+def _logn(x, d=1.0):
+    try:
+        return math.log10(max(float(x), 1.0)) / d
+    except Exception:
+        return 0.0
+
+def compute_significance_row(row) -> float:
+    """
+    Heuristic significance score (0..100).
+    Encourages positive narrative; reflects but does not enforce canonical bias.
+    """
+    w = dict(master=0.35, museum=0.20, cites=0.15, exhib=0.10, auction=0.10, views=0.10)
+    score = 0.0
+    # Masterwork
+    if str(row.get("is_masterwork", "0")).lower() in ["1", "true", "yes", "y"]:
+        score += w["master"] * 1.0
+    # Museum quality
+    museum = str(row.get("museum", "")).lower()
+    if museum:
+        if any(m in museum for m in TOP_MUSEUMS):
+            score += w["museum"] * 1.0
+        else:
+            score += w["museum"] * 0.5
+    # Citations / Exhibitions / Auction / Views (log scaled, approximated to 0..1)
+    score += w["cites"]   * _logn(row.get("citations", 0),        d=3.0)
+    score += w["exhib"]   * _logn(row.get("exhibitions", 0),      d=2.0)
+    score += w["auction"] * _logn(row.get("auction_price_usd",0), d=8.0)
+    score += w["views"]   * _logn(row.get("views_per_year", 0),   d=6.0)
+    return float(np.clip(score, 0.0, 1.0) * 100.0)
+
+def significance_badges(row) -> List[str]:
+    """Derive up to 3 badges for UI display."""
+    badges = []
+    if str(row.get("is_masterwork","0")).lower() in ["1","true","yes","y"]:
+        badges.append("Masterwork")
+    museum = str(row.get("museum", ""))
+    if museum:
+        badges.append("Permanent Collection")
+    try:
+        if int(row.get("citations", 0)) >= 50:
+            badges.append("Canon")
+    except Exception:
+        pass
+    return badges[:3]
+
+def filename_key(path_or_name: str) -> str:
+    """Normalize to just the basename for cross-lookup with metadata."""
+    return Path(path_or_name).name
+
+# Precompute a fast lookup: filename -> row (Series)
+META_BY_NAME = {}
+if not META.empty and "filename" in META.columns:
+    for _, r in META.iterrows():
+        META_BY_NAME[filename_key(str(r.get("filename","")))] = r
+
+# -------------------- OpenCLIP --------------------
 @st.cache_resource(show_spinner=False)
 def load_openclip():
     try:
@@ -191,14 +265,36 @@ def embed_image_clip(img_bytes: bytes) -> Optional[np.ndarray]:
     except Exception:
         return None
 
-# ---------- Feature extraction & cache ----------
+# -------------------- YOLO weights via HuggingFace (optional) --------------------
+def get_yolo_pose_weights_path() -> Optional[str]:
+    """
+    Try pulling YOLOv8n-pose weights from Hugging Face.
+    Falls back to local 'yolov8n-pose.pt' name if huggingface_hub not available.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception:
+        return "yolov8n-pose.pt"  # Ultralytics will auto-download if allowed
+    try:
+        local = hf_hub_download(
+            repo_id="ultralytics/yolov8n-pose",
+            filename="yolov8n-pose.pt",
+            local_dir=str(Path.home() / ".cache" / "hf"),
+            local_dir_use_symlinks=False
+        )
+        return local
+    except Exception:
+        return "yolov8n-pose.pt"
+
+# -------------------- Feature extraction & cache --------------------
 EMB_PATH   = CACHE_DIR / "embeddings.npy"
 IDS_PATH   = CACHE_DIR / "ids.json"
 POSE_PATH  = CACHE_DIR / "pose.npy"      # optional
 COLOR_PATH = CACHE_DIR / "color.npy"     # optional
+SIG_PATH   = CACHE_DIR / "significance.npy"
 
 def _color_feature(im: Image.Image) -> np.ndarray:
-    # HSV hist (H32, S16, V8) → L2-normalized
+    # HSV histogram (H 32, S 16, V 8) → L2-normalized
     im = im.resize((256, 256), Image.BILINEAR)
     arr = np.array(im.convert("HSV"))
     h, s, v = arr[..., 0], arr[..., 1], arr[..., 2]
@@ -209,7 +305,7 @@ def _color_feature(im: Image.Image) -> np.ndarray:
     return feat / (np.linalg.norm(feat) + 1e-8)
 
 def _pose_feature_from_kpts(kpts_xyv: np.ndarray) -> np.ndarray:
-    # kpts: (N,3) x,y,score → normalize to unit box; flatten
+    # kpts: (N,3) x,y,score → normalized to unit box → flattened (34 dims)
     if kpts_xyv is None or len(kpts_xyv) == 0:
         return np.zeros(34, dtype="float32")  # 17*2
     xy = kpts_xyv[:, :2]
@@ -225,12 +321,14 @@ def _pose_feature_from_kpts(kpts_xyv: np.ndarray) -> np.ndarray:
     return feat / (np.linalg.norm(feat) + 1e-8)
 
 def _detect_pose_pil(im: Image.Image) -> Optional[np.ndarray]:
+    """Return a compact pose feature (34-dim) or None."""
     try:
         from ultralytics import YOLO
     except Exception:
         return None
     try:
-        model = YOLO("yolov8n-pose.pt")
+        weights = get_yolo_pose_weights_path()
+        model = YOLO(weights)
         arr = np.array(im.convert("RGB"))
         res = model.predict(
             source=arr, imgsz=512, conf=0.25, verbose=False, device=yolo_device()
@@ -238,10 +336,10 @@ def _detect_pose_pil(im: Image.Image) -> Optional[np.ndarray]:
         if not res or len(res[0].keypoints) == 0:
             return None
         kpts = res[0].keypoints.xy.cpu().numpy()
-        if kpts.ndim == 4:
+        if kpts.ndim == 4:  # (B, persons, 17, 2)
             kpts = kpts[0]
         if kpts.ndim == 3:
-            k = kpts[0]
+            k = kpts[0]     # take first person
         else:
             return None
         v = np.ones((k.shape[0], 1), dtype="float32")
@@ -259,82 +357,94 @@ def _dataset_pose_feature(path: Path) -> Optional[np.ndarray]:
 
 @st.cache_data(show_spinner=True, persist=True)
 def build_dataset_embeddings(files: List[Path]):
-    """Return (clip_embeds, ids, pose_feats, color_feats)"""
+    """Return (clip_embeds, ids, pose_feats, color_feats, signif_norm), aligned to IDS."""
     ids = [str(p.relative_to(APP_DIR)) for p in files]
 
-    # try cache first
-    if EMB_PATH.exists() and IDS_PATH.exists():
+    # Try cache first
+    if EMB_PATH.exists() and IDS_PATH.exists() and SIG_PATH.exists():
         try:
             cached_ids = json.loads(IDS_PATH.read_text())
             if cached_ids == ids:
                 clip_arr  = np.load(EMB_PATH)
                 pose_arr  = np.load(POSE_PATH)  if POSE_PATH.exists()  else None
                 color_arr = np.load(COLOR_PATH) if COLOR_PATH.exists() else None
-                return clip_arr, ids, pose_arr, color_arr
+                sig_arr   = np.load(SIG_PATH)
+                return clip_arr, ids, pose_arr, color_arr, sig_arr
         except Exception:
             pass
 
-    # rebuild
+    # Build afresh
     clip_feats, pose_feats, color_feats = [], [], []
+    signif_vals = []
+
     if MODEL_CLIP is None:
         st.error("OpenCLIP not ready; cannot build embeddings.")
-        return np.zeros((0, 512), dtype="float32"), ids, None, None
+        return np.zeros((0, 512), dtype="float32"), ids, None, None, np.zeros((0,), dtype="float32")
 
     progress = st.progress(0.0, text="Building dataset embeddings/features…")
     for i, p in enumerate(files):
         progress.progress((i + 1) / max(1, len(files)))
         im = load_image_safe(p)
-        if im is None:
-            clip_feats.append(np.zeros(512, dtype="float32"))
-            pose_feats.append(np.zeros(34,  dtype="float32"))
-            color_feats.append(np.zeros(56, dtype="float32"))
-            continue
 
-        # CLIP
-        try:
-            im_clip = center_crop_long_edge(im, 224)
-            x = tensor_from_pil_clip(im_clip)
-            with torch.no_grad():
-                z = MODEL_CLIP.encode_image(x)
-                z = z / z.norm(dim=-1, keepdim=True)
-            clip_feats.append(z.cpu().numpy().astype("float32")[0])
-        except Exception:
+        # --- CLIP ---
+        if im is not None:
+            try:
+                im_clip = center_crop_long_edge(im, 224)
+                x = tensor_from_pil_clip(im_clip)
+                with torch.no_grad():
+                    z = MODEL_CLIP.encode_image(x)
+                    z = z / z.norm(dim=-1, keepdim=True)
+                clip_feats.append(z.cpu().numpy().astype("float32")[0])
+            except Exception:
+                clip_feats.append(np.zeros(512, dtype="float32"))
+        else:
             clip_feats.append(np.zeros(512, dtype="float32"))
 
-        # Color
-        try:
-            color_feats.append(_color_feature(im))
-        except Exception:
+        # --- Color ---
+        if im is not None:
+            try:
+                color_feats.append(_color_feature(im))
+            except Exception:
+                color_feats.append(np.zeros(56, dtype="float32"))  # 32 + 16 + 8
+        else:
             color_feats.append(np.zeros(56, dtype="float32"))
 
-        # Pose (optional)
+        # --- Pose (optional; slow if many images) ---
         pf = _dataset_pose_feature(p)
         pose_feats.append(pf if pf is not None else np.zeros(34, dtype="float32"))
+
+        # --- Significance per file (0..1 normalized; we'll keep 0..1 here) ---
+        fname = filename_key(p.name)
+        row = META_BY_NAME.get(fname)
+        sig = compute_significance_row(row) / 100.0 if row is not None else 0.0
+        signif_vals.append(float(sig))
 
     clip_arr  = np.vstack(clip_feats).astype("float32") if clip_feats else np.zeros((0, 512), dtype="float32")
     pose_arr  = np.vstack(pose_feats).astype("float32") if pose_feats else None
     color_arr = np.vstack(color_feats).astype("float32") if color_feats else None
+    sig_arr   = np.array(signif_vals, dtype="float32")
 
-    # cache to disk
+    # Cache
     try:
         np.save(EMB_PATH, clip_arr)
         np.save(POSE_PATH, pose_arr)
         np.save(COLOR_PATH, color_arr)
+        np.save(SIG_PATH,  sig_arr)
         IDS_PATH.write_text(json.dumps(ids))
     except Exception:
         pass
 
-    return clip_arr, ids, pose_arr, color_arr
+    return clip_arr, ids, pose_arr, color_arr, sig_arr
 
-# Build dataset features
+# ---- Build dataset features ----
 if len(DATASET_FILES) == 0:
     st.error(f"❌ No images found or folder is empty: {IMAGES_DIR}\nMake sure iCloud files are downloaded locally (no .icloud).")
 else:
     st.success(f"✅ Dataset images: {len(DATASET_FILES)}")
 
-CLIP_DS, IDS, POSE_DS, COLOR_DS = build_dataset_embeddings(DATASET_FILES)
+CLIP_DS, IDS, POSE_DS, COLOR_DS, SIG_DS = build_dataset_embeddings(DATASET_FILES)  # SIG_DS in [0,1]
 
-# Ready state (controls button enabled/disabled)
+# ---- Ready checks (controls button enabled state) ----
 READY = True
 reasons = []
 if MODEL_CLIP is None:
@@ -352,24 +462,28 @@ if not READY:
 else:
     st.success("Matching is ready ✔")
 
-# ---------- Similarity ----------
+# -------------------- Similarity --------------------
 def cos_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Cosine similarity between a (1xd or nd) and b (mxd)."""
+    if a is None or b is None:
+        return None
     if a.ndim == 1:
         a = a[None, :]
     a = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
     b = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-8)
     return (a @ b.T)
 
-# ---------- Pose overlay (for preview) ----------
+# -------------------- Pose overlay (preview only) --------------------
 def draw_skeleton_overlay(im: Image.Image) -> Tuple[Image.Image, Optional[np.ndarray]]:
-    """Returns (image_with_overlay, pose_feature or None)"""
+    """Return (image_with_overlay, pose_feature or None)."""
     try:
         from ultralytics import YOLO
         import cv2
     except Exception:
         return im, None
 
-    model = YOLO("yolov8n-pose.pt")
+    weights = get_yolo_pose_weights_path()
+    model = YOLO(weights)
     arr = np.array(im.convert("RGB"))
     res = model.predict(
         source=arr, imgsz=512, conf=0.25, verbose=False, device=yolo_device()
@@ -407,18 +521,18 @@ def draw_skeleton_overlay(im: Image.Image) -> Tuple[Image.Image, Optional[np.nda
     pf = _pose_feature_from_kpts(kxyv)
     return im_draw, pf
 
-# ---------- UI — Main ----------
+# -------------------- UI — Main --------------------
 st.title("Embodied Aesthetic Reconstruction")
-st.caption("Camera / Upload → CLIP + Pose + Color matching → Top-K artworks")
+st.caption("Camera / Upload → CLIP + Pose + Color + Significance → Top-K artworks")
 
-# Status block
+# Status
 status_cols = st.columns(3)
 with status_cols[0]:
     st.success(f"Images dir: {IMAGES_DIR.relative_to(APP_DIR)}" if IMAGES_DIR.exists() else f"Missing: {IMAGES_DIR}")
 with status_cols[1]:
     st.info(f"Dataset files: {len(DATASET_FILES)}")
 with status_cols[2]:
-    st.info(f"Models: OpenCLIP={'✔︎' if MODEL_CLIP else '✖︎'} · Pose(ultralytics)={'✔︎' if POSE_DS is not None else '◦'}")
+    st.info(f"Models: OpenCLIP={'✔︎' if MODEL_CLIP else '✖︎'} · Pose(ultralytics)={'✔︎'}")
 
 st.markdown("---")
 
@@ -466,10 +580,11 @@ with right:
         except Exception as e:
             st.error(f"Upload decode failed: {e}")
 
-# Matching button (disabled until READY)
+# Run button
 st.markdown("---")
 run = st.button("🔎 Run Matching", disabled=not READY)
 
+# -------------------- Display helpers --------------------
 def display_results(idx_scores: List[Tuple[int, float]], k: int):
     if len(idx_scores) == 0:
         st.warning("No results to display.")
@@ -479,26 +594,41 @@ def display_results(idx_scores: List[Tuple[int, float]], k: int):
         fn_rel = IDS[idx]
         p = (APP_DIR / fn_rel).resolve()
         im = load_image_safe(p)
-        # metadata (if available)
-        row = None
-        if not META.empty and "filename" in META.columns:
-            rowset = META[META["filename"].astype(str).str.contains(Path(fn_rel).name)]
-            if len(rowset) > 0:
-                row = rowset.iloc[0]
+
+        # Metadata lookup
+        row = META_BY_NAME.get(filename_key(p.name))
         if row is not None:
-            title = str(row.get("title", "")).strip()
+            title  = str(row.get("title", "")).strip()
             artist = str(row.get("artist", "")).strip()
-            year = str(row.get("year", "")).strip()
+            year   = str(row.get("year", "")).strip()
+            museum = str(row.get("museum", "")).strip()
+            links  = str(row.get("source_links", "")).strip()
+            sig100 = compute_significance_row(row)
+            badges = significance_badges(row)
             meta_txt = f"{title} — {artist} ({year})"
         else:
+            sig100, badges, links = 0.0, [], ""
             meta_txt = Path(fn_rel).name
+            museum = ""
 
         with cols[i % len(cols)]:
             if im is not None:
                 st.image(im, use_container_width=True)
             st.markdown(f"**Score:** {sc:.3f}")
             st.caption(meta_txt)
+            if museum:
+                st.caption(f"🏛️ {museum}")
+            # Significance line
+            st.markdown(f"**Significance:** {sig100:.0f}/100")
+            if badges:
+                st.caption(" · ".join(badges))
+            # Learn more (first link if available)
+            if links:
+                first = links.split(";")[0].strip()
+                if first:
+                    st.write(f"[Learn more]({first})")
 
+# -------------------- Matching --------------------
 if run:
     if query_img is None:
         st.warning("Please take a photo or upload an image first.")
@@ -527,7 +657,7 @@ if run:
         if w_pose > 0 and w_pose_eff == 0.0:
             st.info("No pose feature detected or dataset pose not precomputed; treating Pose weight as 0.")
 
-        # Build filtered index set
+        # Build filtered view
         valid_indices = np.arange(len(IDS))
         if require_public and not META.empty and {"filename", "license"}.issubset(META.columns):
             pd_mask = META["license"].astype(str).str.contains("Public Domain", case=False, na=False)
@@ -538,7 +668,7 @@ if run:
             else:
                 st.warning("No entries meet Public-Domain filter; ignoring filter.")
 
-        # Slice feature banks to filtered pool and score locally
+        # Slice feature banks to filtered pool
         def slicer(arr):
             if arr is None or arr.shape[0] != len(IDS):
                 return None
@@ -547,7 +677,9 @@ if run:
         CLIP_POOL  = slicer(CLIP_DS)
         POSE_POOL  = slicer(POSE_DS)
         COLOR_POOL = slicer(COLOR_DS)
+        SIG_POOL   = SIG_DS[valid_indices] if SIG_DS is not None and SIG_DS.shape[0] == len(IDS) else None  # in [0,1]
 
+        # Local cosine scores
         def cos_sim_local(q, bank):
             if q is None or bank is None:
                 return None
@@ -564,6 +696,11 @@ if run:
         s = cos_sim_local(q_color, COLOR_POOL)
         if s is not None: score += w_color * s
 
+        # Add significance as a prior (no cosine; already [0,1])
+        if SIG_POOL is not None and w_sig > 0.0:
+            score += w_sig * SIG_POOL
+
+        # Rank
         topk_local = np.argsort(-score)[:min(top_k, score.size)]
         results = [(int(valid_indices[i]), float(score[i])) for i in topk_local]
 
@@ -572,15 +709,16 @@ if run:
 
         display_results(results, k=top_k)
 
-# Tips
+# -------------------- Tips --------------------
 with st.expander("Tips"):
     st.markdown(
         """
 - If you see **iCloud .icloud** placeholders, open the folder in Finder and choose **“Download Now”**.
-- Adjust **CLIP / Pose / Color** weights in the sidebar to influence ranking.
+- Adjust **CLIP / Pose / Color / Significance** weights to influence ranking.
 - The **Public-Domain** filter works only if `license` exists in your metadata CSV.
 - First run builds and caches dataset features in `.clip_cache/`.
-- Pose detection uses `ultralytics` (YOLOv8n-pose). Ensure the model downloads once with internet access.
-- If you only want CLIP + Color, set Pose weight to 0.
+- Pose detection uses `ultralytics` (YOLOv8n-pose). Weights are pulled from Hugging Face when possible.
+- If you only want CLIP + Color, set Pose and Significance weights to 0.
+- *Significance* is a heuristic combining museum presence, citations, and attention. It reflects historical canons yet encourages plural aesthetics.
 """
     )
