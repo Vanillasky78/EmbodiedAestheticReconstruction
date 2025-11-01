@@ -35,3 +35,9 @@ embodied-aesthetic-reconstruction/
 ├── requirements.txt        # Dependencies
 └── README.md               # Project description
 
+
+cd ~/Documents/GitHub/EmbodiedAestheticReconstruction
+conda env create -f environment.yml
+conda activate ear-mvp
+streamlit run app.py
+
