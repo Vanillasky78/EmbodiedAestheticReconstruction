@@ -1,21 +1,19 @@
 # app.py
 # Embodied Aesthetic Reconstruction — Streamlit App (M4 / macOS ready)
 # -------------------------------------------------------------------
-# Features
 # - Robust path resolution (always finds data/images next to this file)
 # - Skips iCloud placeholder files (*.icloud)
 # - Upload or camera capture; optional skeleton overlay
 # - CLIP / Color / Pose tri-fusion with user-adjustable weights
 # - Public-Domain filter (if present in metadata)
 # - Auto-caching of models and dataset embeddings
-# - Graceful fallbacks when optional deps/models are missing
+# - YOLO device mapping for Apple Silicon (mps) — no CUDA required on macOS
 # -------------------------------------------------------------------
 
 from __future__ import annotations
-import os
 import io
-import time
 import json
+import time
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -24,7 +22,7 @@ import pandas as pd
 from PIL import Image, ImageOps
 import streamlit as st
 
-# ---------- Device / Torch ----------
+# ---------- Torch / device ----------
 try:
     import torch
     TORCH_OK = True
@@ -45,6 +43,21 @@ def get_device() -> str:
 
 DEVICE = get_device()
 
+# Torch perf (safe no-op if unsupported)
+if TORCH_OK:
+    try:
+        torch.set_float32_matmul_precision("medium")
+    except Exception:
+        pass
+
+def yolo_device() -> str:
+    """Map our torch device to Ultralytics' expected device string."""
+    if DEVICE == "mps":
+        return "mps"      # Apple Silicon GPU via Metal
+    if DEVICE == "cuda":
+        return "0"        # first CUDA GPU
+    return "cpu"
+
 # ---------- Paths ----------
 APP_DIR = Path(__file__).parent.resolve()
 DATA_DIR = APP_DIR / "data"
@@ -53,19 +66,18 @@ INTERIM_DIR = DATA_DIR / "interim"
 CACHE_DIR = APP_DIR / ".clip_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 INTERIM_DIR.mkdir(parents=True, exist_ok=True)
-
 METADATA_CSV = DATA_DIR / "portrait_works.csv"
 
-# ---------- UI CONFIG ----------
+# ---------- UI config ----------
 st.set_page_config(
     page_title="Embodied Aesthetic Reconstruction",
     page_icon="🖼️",
     layout="wide",
 )
 
-# ---------- Utils ----------
+# ---------- Utilities ----------
 def is_icloud_placeholder(p: Path) -> bool:
-    # iCloud keeps placeholders like `xxx.jpg.icloud` (sometimes hidden)
+    # iCloud keeps placeholders like `file.jpg.icloud` (sometimes hidden)
     return p.suffix == ".icloud" or p.name.endswith(".icloud")
 
 def load_image_safe(path: Path) -> Optional[Image.Image]:
@@ -112,26 +124,24 @@ with st.sidebar:
     st.header("🧍 Overlay")
     overlay_skeleton = st.checkbox("Draw skeleton on preview (if available)", value=True)
 
-# ---------- Load metadata ----------
+# ---------- Metadata & dataset ----------
 def load_metadata() -> pd.DataFrame:
     if METADATA_CSV.exists():
         try:
-            df = pd.read_csv(METADATA_CSV)
-            return df
+            return pd.read_csv(METADATA_CSV)
         except Exception as e:
             st.warning(f"Could not read metadata CSV ({METADATA_CSV.name}): {e}")
     return pd.DataFrame({"filename": [], "title": [], "artist": [], "year": [], "license": []})
 
 META = load_metadata()
 
-# ---------- Collect dataset images ----------
 def list_dataset_images() -> List[Path]:
     if not IMAGES_DIR.exists():
         return []
-    all_files = []
+    files: List[Path] = []
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"):
-        all_files += list(IMAGES_DIR.glob(ext))
-    files = [p for p in all_files if not is_icloud_placeholder(p)]
+        files += list(IMAGES_DIR.glob(ext))
+    files = [p for p in files if not is_icloud_placeholder(p)]
     return sorted(files)
 
 DATASET_FILES = list_dataset_images()
@@ -142,7 +152,7 @@ def load_openclip():
     try:
         import open_clip
     except Exception as e:
-        st.error(f"open_clip_torch is not installed: {e}")
+        st.error(f"open_clip_torch not installed: {e}")
         return None, None, None
     try:
         model_name, pretrained = "ViT-B-32", "laion2b_s34b_b79k"
@@ -181,28 +191,27 @@ def embed_image_clip(img_bytes: bytes) -> Optional[np.ndarray]:
     except Exception:
         return None
 
-# ---------- Dataset Embeddings ----------
-EMB_PATH = CACHE_DIR / "embeddings.npy"
-IDS_PATH = CACHE_DIR / "ids.json"
-POSE_PATH = CACHE_DIR / "pose.npy"      # (optional)
-COLOR_PATH = CACHE_DIR / "color.npy"    # (optional)
+# ---------- Feature extraction & cache ----------
+EMB_PATH   = CACHE_DIR / "embeddings.npy"
+IDS_PATH   = CACHE_DIR / "ids.json"
+POSE_PATH  = CACHE_DIR / "pose.npy"      # optional
+COLOR_PATH = CACHE_DIR / "color.npy"     # optional
 
 def _color_feature(im: Image.Image) -> np.ndarray:
-    # HSV histogram (H 32, S 16, V 8) → L2-normalize → float32
+    # HSV hist (H32, S16, V8) → L2-normalized
     im = im.resize((256, 256), Image.BILINEAR)
     arr = np.array(im.convert("HSV"))
     h, s, v = arr[..., 0], arr[..., 1], arr[..., 2]
     hist_h, _ = np.histogram(h, bins=32, range=(0, 255), density=True)
     hist_s, _ = np.histogram(s, bins=16, range=(0, 255), density=True)
-    hist_v, _ = np.histogram(v, bins=8, range=(0, 255), density=True)
+    hist_v, _ = np.histogram(v, bins=8,  range=(0, 255), density=True)
     feat = np.concatenate([hist_h, hist_s, hist_v]).astype("float32")
-    norm = np.linalg.norm(feat) + 1e-8
-    return feat / norm
+    return feat / (np.linalg.norm(feat) + 1e-8)
 
 def _pose_feature_from_kpts(kpts_xyv: np.ndarray) -> np.ndarray:
-    # kpts: (N, 3) x,y,score → normalize to unit box; flatten; zero if invalid
+    # kpts: (N,3) x,y,score → normalize to unit box; flatten
     if kpts_xyv is None or len(kpts_xyv) == 0:
-        return np.zeros(34, dtype="float32")  # 17*2 for COCO
+        return np.zeros(34, dtype="float32")  # 17*2
     xy = kpts_xyv[:, :2]
     min_xy = xy.min(0)
     max_xy = xy.max(0)
@@ -213,11 +222,9 @@ def _pose_feature_from_kpts(kpts_xyv: np.ndarray) -> np.ndarray:
         feat = np.pad(feat, (0, 34 - feat.shape[0]))
     else:
         feat = feat[:34]
-    n = np.linalg.norm(feat) + 1e-8
-    return feat / n
+    return feat / (np.linalg.norm(feat) + 1e-8)
 
 def _detect_pose_pil(im: Image.Image) -> Optional[np.ndarray]:
-    # YOLOv8n-pose via ultralytics
     try:
         from ultralytics import YOLO
     except Exception:
@@ -225,11 +232,12 @@ def _detect_pose_pil(im: Image.Image) -> Optional[np.ndarray]:
     try:
         model = YOLO("yolov8n-pose.pt")
         arr = np.array(im.convert("RGB"))
-        res = model.predict(source=arr, imgsz=512, conf=0.25, verbose=False,
-                            device=0 if DEVICE != "cpu" else "cpu")
+        res = model.predict(
+            source=arr, imgsz=512, conf=0.25, verbose=False, device=yolo_device()
+        )
         if not res or len(res[0].keypoints) == 0:
             return None
-        kpts = res[0].keypoints.xy.cpu().numpy()  # (persons, 17, 2)
+        kpts = res[0].keypoints.xy.cpu().numpy()
         if kpts.ndim == 4:
             kpts = kpts[0]
         if kpts.ndim == 3:
@@ -250,25 +258,26 @@ def _dataset_pose_feature(path: Path) -> Optional[np.ndarray]:
     return _detect_pose_pil(im_small)
 
 @st.cache_data(show_spinner=True, persist=True)
-def build_dataset_embeddings(files: List[Path]) -> Tuple[np.ndarray, List[str], Optional[np.ndarray], Optional[np.ndarray]]:
+def build_dataset_embeddings(files: List[Path]):
     """Return (clip_embeds, ids, pose_feats, color_feats)"""
     ids = [str(p.relative_to(APP_DIR)) for p in files]
-    clip_feats, pose_feats, color_feats = [], [], []
 
-    # Try to load cached
+    # try cache first
     if EMB_PATH.exists() and IDS_PATH.exists():
         try:
             cached_ids = json.loads(IDS_PATH.read_text())
             if cached_ids == ids:
-                clip_feats = np.load(EMB_PATH)
-                pose_feats = np.load(POSE_PATH) if POSE_PATH.exists() else None
-                color_feats = np.load(COLOR_PATH) if COLOR_PATH.exists() else None
-                return clip_feats, ids, pose_feats, color_feats
+                clip_arr  = np.load(EMB_PATH)
+                pose_arr  = np.load(POSE_PATH)  if POSE_PATH.exists()  else None
+                color_arr = np.load(COLOR_PATH) if COLOR_PATH.exists() else None
+                return clip_arr, ids, pose_arr, color_arr
         except Exception:
             pass
 
+    # rebuild
+    clip_feats, pose_feats, color_feats = [], [], []
     if MODEL_CLIP is None:
-        st.error("OpenCLIP not ready; cannot build dataset embeddings.")
+        st.error("OpenCLIP not ready; cannot build embeddings.")
         return np.zeros((0, 512), dtype="float32"), ids, None, None
 
     progress = st.progress(0.0, text="Building dataset embeddings/features…")
@@ -277,8 +286,8 @@ def build_dataset_embeddings(files: List[Path]) -> Tuple[np.ndarray, List[str], 
         im = load_image_safe(p)
         if im is None:
             clip_feats.append(np.zeros(512, dtype="float32"))
-            pose_feats.append(np.zeros(34, dtype="float32"))
-            color_feats.append(np.zeros(56, dtype="float32"))  # 32+16+8
+            pose_feats.append(np.zeros(34,  dtype="float32"))
+            color_feats.append(np.zeros(56, dtype="float32"))
             continue
 
         # CLIP
@@ -300,15 +309,13 @@ def build_dataset_embeddings(files: List[Path]) -> Tuple[np.ndarray, List[str], 
 
         # Pose (optional)
         pf = _dataset_pose_feature(p)
-        if pf is None:
-            pf = np.zeros(34, dtype="float32")
-        pose_feats.append(pf)
+        pose_feats.append(pf if pf is not None else np.zeros(34, dtype="float32"))
 
-    clip_arr = np.vstack(clip_feats).astype("float32") if clip_feats else np.zeros((0, 512), dtype="float32")
-    pose_arr = np.vstack(pose_feats).astype("float32") if pose_feats else None
+    clip_arr  = np.vstack(clip_feats).astype("float32") if clip_feats else np.zeros((0, 512), dtype="float32")
+    pose_arr  = np.vstack(pose_feats).astype("float32") if pose_feats else None
     color_arr = np.vstack(color_feats).astype("float32") if color_feats else None
 
-    # Cache
+    # cache to disk
     try:
         np.save(EMB_PATH, clip_arr)
         np.save(POSE_PATH, pose_arr)
@@ -327,6 +334,24 @@ else:
 
 CLIP_DS, IDS, POSE_DS, COLOR_DS = build_dataset_embeddings(DATASET_FILES)
 
+# Ready state (controls button enabled/disabled)
+READY = True
+reasons = []
+if MODEL_CLIP is None:
+    READY = False
+    reasons.append("OpenCLIP not loaded.")
+if len(DATASET_FILES) == 0:
+    READY = False
+    reasons.append("No images in data/images (or still .icloud placeholders).")
+if CLIP_DS is None or getattr(CLIP_DS, "shape", (0,))[0] == 0:
+    READY = False
+    reasons.append("Dataset embeddings not built yet (first run may take a while).")
+
+if not READY:
+    st.warning("Matching is not ready: " + " ".join(reasons))
+else:
+    st.success("Matching is ready ✔")
+
 # ---------- Similarity ----------
 def cos_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     if a.ndim == 1:
@@ -335,29 +360,7 @@ def cos_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     b = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-8)
     return (a @ b.T)
 
-def rank_results(
-    q_clip: Optional[np.ndarray],
-    q_pose: Optional[np.ndarray],
-    q_color: Optional[np.ndarray],
-    topk: int,
-    weights: Tuple[float, float, float],
-) -> List[Tuple[int, float]]:
-    w_clip, w_pose, w_color = weights
-    score = np.zeros(len(IDS), dtype="float32")
-
-    if q_clip is not None and CLIP_DS.shape[0] == len(IDS):
-        score += w_clip * cos_sim(q_clip, CLIP_DS)[0]
-
-    if q_pose is not None and POSE_DS is not None:
-        score += w_pose * cos_sim(q_pose, POSE_DS)[0]
-
-    if q_color is not None and COLOR_DS is not None:
-        score += w_color * cos_sim(q_color, COLOR_DS)[0]
-
-    idx = np.argsort(-score)[:topk]
-    return [(int(i), float(score[i])) for i in idx]
-
-# ---------- Pose overlay ----------
+# ---------- Pose overlay (for preview) ----------
 def draw_skeleton_overlay(im: Image.Image) -> Tuple[Image.Image, Optional[np.ndarray]]:
     """Returns (image_with_overlay, pose_feature or None)"""
     try:
@@ -368,26 +371,25 @@ def draw_skeleton_overlay(im: Image.Image) -> Tuple[Image.Image, Optional[np.nda
 
     model = YOLO("yolov8n-pose.pt")
     arr = np.array(im.convert("RGB"))
-    res = model.predict(source=arr, imgsz=512, conf=0.25, verbose=False,
-                        device=0 if DEVICE != "cpu" else "cpu")
+    res = model.predict(
+        source=arr, imgsz=512, conf=0.25, verbose=False, device=yolo_device()
+    )
     if not res or len(res[0].keypoints) == 0:
         return im, None
 
-    # Draw on a copy
     canvas = arr.copy()
     K = res[0].keypoints
     pts = K.xy.cpu().numpy()
     if pts.ndim == 4:
         pts = pts[0]
     if pts.ndim == 3:
-        pts = pts[0]  # take first person
+        pts = pts[0]  # first person
 
     PAIRS = [
         (5, 7), (7, 9), (6, 8), (8,10),      # arms
         (11,13), (13,15), (12,14), (14,16),  # legs
         (5,6), (11,12), (5,11), (6,12)       # torso
     ]
-
     try:
         import cv2
         for (a, b) in PAIRS:
@@ -412,10 +414,7 @@ st.caption("Camera / Upload → CLIP + Pose + Color matching → Top-K artworks"
 # Status block
 status_cols = st.columns(3)
 with status_cols[0]:
-    if IMAGES_DIR.exists():
-        st.success(f"Images dir: {IMAGES_DIR.relative_to(APP_DIR)}")
-    else:
-        st.error(f"Missing folder: {IMAGES_DIR}")
+    st.success(f"Images dir: {IMAGES_DIR.relative_to(APP_DIR)}" if IMAGES_DIR.exists() else f"Missing: {IMAGES_DIR}")
 with status_cols[1]:
     st.info(f"Dataset files: {len(DATASET_FILES)}")
 with status_cols[2]:
@@ -467,18 +466,9 @@ with right:
         except Exception as e:
             st.error(f"Upload decode failed: {e}")
 
-# Matching button
+# Matching button (disabled until READY)
 st.markdown("---")
-run = st.button("🔎 Run Matching")
-
-def df_filter_public(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    if "license" not in df.columns:
-        return df
-    if not require_public:
-        return df
-    return df[df["license"].astype(str).str.contains("Public Domain", case=False, na=False)]
+run = st.button("🔎 Run Matching", disabled=not READY)
 
 def display_results(idx_scores: List[Tuple[int, float]], k: int):
     if len(idx_scores) == 0:
@@ -489,7 +479,7 @@ def display_results(idx_scores: List[Tuple[int, float]], k: int):
         fn_rel = IDS[idx]
         p = (APP_DIR / fn_rel).resolve()
         im = load_image_safe(p)
-        # attach metadata if available
+        # metadata (if available)
         row = None
         if not META.empty and "filename" in META.columns:
             rowset = META[META["filename"].astype(str).str.contains(Path(fn_rel).name)]
@@ -516,7 +506,7 @@ if run:
         st.write("Computing embeddings…")
         t0 = time.time()
 
-        # Query CLIP
+        # Query features
         q_clip = None
         if MODEL_CLIP is not None:
             try:
@@ -526,57 +516,56 @@ if run:
             except Exception:
                 q_clip = None
 
-        # Query color
         try:
             q_color = _color_feature(query_img)
         except Exception:
             q_color = None
 
-        # Query pose (may already exist from overlay step)
         if query_pose_feat is None and w_pose > 0:
             query_pose_feat = _detect_pose_pil(center_crop_long_edge(query_img, 512))
-
-        # If pose backend missing, zero its weight
         w_pose_eff = w_pose if query_pose_feat is not None and POSE_DS is not None else 0.0
         if w_pose > 0 and w_pose_eff == 0.0:
             st.info("No pose feature detected or dataset pose not precomputed; treating Pose weight as 0.")
 
-        # Filter dataset by license if requested
+        # Build filtered index set
         valid_indices = np.arange(len(IDS))
-        if require_public and not META.empty and "filename" in META.columns and "license" in META.columns:
+        if require_public and not META.empty and {"filename", "license"}.issubset(META.columns):
             pd_mask = META["license"].astype(str).str.contains("Public Domain", case=False, na=False)
             pool_names = set(META.loc[pd_mask, "filename"].astype(str).apply(lambda s: Path(s).name))
-            idx_mask = [i for i, fn in enumerate(IDS) if Path(fn).name in pool_names]
-            if len(idx_mask) == 0:
-                st.warning("No entries meet Public-Domain filter; ignoring filter.")
+            filt = [i for i, fn in enumerate(IDS) if Path(fn).name in pool_names]
+            if len(filt) > 0:
+                valid_indices = np.array(filt, dtype=int)
             else:
-                valid_indices = np.array(idx_mask, dtype=int)
+                st.warning("No entries meet Public-Domain filter; ignoring filter.")
 
-        # Prepare feature pools
-        def take_rows(arr: Optional[np.ndarray], idxs: np.ndarray) -> Optional[np.ndarray]:
-            if arr is None:
+        # Slice feature banks to filtered pool and score locally
+        def slicer(arr):
+            if arr is None or arr.shape[0] != len(IDS):
                 return None
-            return arr[idxs] if arr.shape[0] == len(IDS) else None
+            return arr[valid_indices]
 
-        # (Note: pools are not directly used below since we score against full arrays;
-        # kept here if you later want to narrow scoring to 'valid_indices'.)
+        CLIP_POOL  = slicer(CLIP_DS)
+        POSE_POOL  = slicer(POSE_DS)
+        COLOR_POOL = slicer(COLOR_DS)
 
-        # Rank across full set, then map indices if filtered:
-        results = rank_results(
-            q_clip=q_clip,
-            q_pose=query_pose_feat,
-            q_color=q_color,
-            topk=min(top_k, len(valid_indices)),
-            weights=(w_clip, w_pose_eff, w_color),
-        )
+        def cos_sim_local(q, bank):
+            if q is None or bank is None:
+                return None
+            a = q[None, :] if q.ndim == 1 else q
+            a = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
+            b = bank / (np.linalg.norm(bank, axis=1, keepdims=True) + 1e-8)
+            return (a @ b.T)[0]
 
-        # Map to filtered indices if needed
-        if len(valid_indices) != len(IDS):
-            mapped = []
-            for local_idx, sc in results:
-                global_idx = int(valid_indices[local_idx])
-                mapped.append((global_idx, sc))
-            results = mapped
+        score = np.zeros(valid_indices.size, dtype="float32")
+        s = cos_sim_local(q_clip, CLIP_POOL)
+        if s is not None: score += w_clip * s
+        s = cos_sim_local(query_pose_feat, POSE_POOL) if w_pose_eff > 0 else None
+        if s is not None: score += w_pose_eff * s
+        s = cos_sim_local(q_color, COLOR_POOL)
+        if s is not None: score += w_color * s
+
+        topk_local = np.argsort(-score)[:min(top_k, score.size)]
+        results = [(int(valid_indices[i]), float(score[i])) for i in topk_local]
 
         dt = (time.time() - t0) * 1000
         st.info(f"Search time: {dt:.1f} ms")

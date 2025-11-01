@@ -40,4 +40,7 @@ cd ~/Documents/GitHub/EmbodiedAestheticReconstruction
 conda env create -f environment.yml
 conda activate ear-mvp
 streamlit run app.py
-
+------
+conda activate ear-mvp
+cd ~/Documents/GitHub/EmbodiedAestheticReconstruction
+streamlit run app.py
