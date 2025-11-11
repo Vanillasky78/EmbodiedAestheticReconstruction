@@ -1,39 +1,29 @@
-# ============================================================
-# Embodied Aesthetic Reconstruction - Full Requirements
-# ============================================================
+# -----------------------------------------------------------------------------
+# EAR-API (Embodied Aesthetic Reconstruction)
+# Multi-Museum FastAPI backend
+# -----------------------------------------------------------------------------
+# ✅ Tested with Python 3.10–3.11
+# ✅ Works on macOS (MPS), Windows, Linux (CUDA)
+# ✅ Compatible with VS Code / Hugging Face / Render
+# -----------------------------------------------------------------------------
 
-# --- Core numerical / ML ---
-torch>=2.1.0
-torchvision
-torchaudio
-numpy
-pandas
-scikit-learn
-faiss-cpu            # For embedding indexing/search (FAISS)
-tqdm                 # Progress bars / CLI feedback
+# --- Core API Framework ---
+fastapi==0.115.2
+uvicorn==0.32.0
 
-# --- Pose estimation ---
-ultralytics>=8.2.0   # YOLOv8-Pose
-opencv-python>=4.8.0
-# macOS MPS sometimes needs this:
-opencv-python-headless; sys_platform == "darwin"
+# --- Numerical & Data Handling ---
+numpy==1.26.4
+pandas==2.2.2
+pillow==10.4.0
 
-# --- CLIP / Image embeddings ---
-open_clip_torch>=2.24.0
-Pillow>=10.0.0
+# --- Computer Vision / Pose Estimation ---
+ultralytics==8.3.34
+opencv-python==4.10.0.84
 
-# --- Web / UI layer (for app.py) ---
-streamlit>=1.36.0
-watchdog             # hot reload stability
+# --- CLIP Embedding (OpenAI / LAION) ---
+open_clip_torch==2.24.0
+torch==2.3.1
+torchvision==0.18.1
 
-# --- Optional visualization & debugging ---
-matplotlib
-seaborn
-plotly
-
-# --- JSON / YAML utilities ---
-pyyaml
-jsonlines
-
-# --- Safety fallback for macOS libomp issue ---
-# (used in run instructions: export KMP_DUPLICATE_LIB_OK=TRUE)
+# --- Optional Utilities (recommended for extended scripts) ---
+tqdm==4.66.4     # progress bars in build_embeddings.py

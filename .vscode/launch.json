@@ -1,0 +1,42 @@
+{
+  // ---------------------------------------------------------------------------
+  // VS Code launch configuration for EAR-API
+  // ---------------------------------------------------------------------------
+  // Usage:
+  //   1. Open the EAR-API project folder in VS Code
+  //   2. Press F5 or click "Run ▶️" in the top bar
+  //   3. The API will start on http://127.0.0.1:8000
+  // ---------------------------------------------------------------------------
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run EAR-API (uvicorn)",
+      "type": "python",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "main:app",
+        "--reload",             // auto-reload when code changes
+        "--port",
+        "8000"
+      ],
+      "jinja": true,
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Build Embeddings (tool script)",
+      "type": "python",
+      "request": "launch",
+      "program": "tools/build_embeddings.py",
+      "args": [
+        "--all",
+        "--overwrite"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
