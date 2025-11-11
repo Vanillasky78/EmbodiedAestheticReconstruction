@@ -1,0 +1,14 @@
+[server]
+headless = true
+maxUploadSize = 20
+enableXsrfProtection = true
+
+[theme]
+base = "light"
+primaryColor = "#111827"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f3f4f6"
+textColor = "#111827"
+
+[client]
+toolbarMode = "viewer"  # hide dev menu
