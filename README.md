@@ -134,3 +134,52 @@ Project: Embodied Aesthetic Reconstruction
 Institute: UAL – Creative Computing Institute (MSc Computing and Creative Industry)
 Enjoy exploring your embodied-AI portrait system on macOS 💫
 
+
+EAR System Architecture Diagram (Text Layout)
+
+┌────────────────────────────┐
+│        👩 Audience          │
+│  Moves or stands in front  │
+│  of camera (pose changes)  │
+└──────────────┬─────────────┘
+               │
+               ▼
+┌────────────────────────────┐
+│   🎨 Streamlit Frontend (UI)
+│  -----------------------------
+│  1️⃣ Captures camera input
+│  2️⃣ Detects stillness (optional)
+│  3️⃣ Sends captured image to API
+│  4️⃣ Displays matched artworks
+│
+│  Modes:
+│   • Local (runs PoseMatcher directly)
+│   • Remote (calls FastAPI backend)
+└──────────────┬─────────────┘
+               │
+               ▼
+┌────────────────────────────┐
+│   ⚙️ FastAPI Backend (Engine)
+│  -----------------------------
+│  Receives image → runs matching:
+│   1️⃣ YOLOv8-Pose (keypoints)
+│   2️⃣ OpenCLIP (embeddings)
+│   3️⃣ Cosine similarity vs database
+│  Returns JSON results to frontend
+│
+│  API endpoints:
+│   - /match
+│   - /list_museums
+│   - /metadata/{museum}/{filename}
+│   - /status
+└──────────────┬─────────────┘
+               │
+               ▼
+┌────────────────────────────┐
+│   🗂️ Data Layer (Artworks DB)
+│  -----------------------------
+│  - data/local/images/ (artwork images)
+│  - data/local/embeddings.npy
+│  - data/local/embeddings_meta.csv
+│  - metadata: artist, title, year, etc.
+└────────────────────────────┘
