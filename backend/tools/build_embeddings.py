@@ -1,275 +1,236 @@
-# tools/build_embeddings.py
-# -----------------------------------------------------------------------------
-# Build CLIP embeddings for images under data/<museum>/images/
-# Outputs:
-#   - data/<museum>/embeddings.npy
-#   - data/<museum>/embeddings_meta.csv  (at least a `filename` column)
-# Optionally merges with an external metadata CSV by `filename`.
-# -----------------------------------------------------------------------------
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-from __future__ import annotations
+"""
+Build CLIP embeddings for a museum folder.
 
-import os
-import csv
-import glob
+Layout (per museum):
+  data/<museum>/
+    images/                  # *.jpg / *.png ...
+    embeddings.npy           # (N, D)
+    embeddings_meta.csv      # at least: filename + optional columns from --meta
+
+Usage:
+  python backend/tools/build_embeddings.py --museum local --meta data/local/portrait_works.csv --overwrite
+  python backend/tools/build_embeddings.py --all --overwrite
+
+Deps:
+  pip install open_clip_torch torch pillow numpy pandas tqdm
+"""
+
 import argparse
-from typing import List, Dict
+import os
+import sys
+from typing import List, Optional
 
 import numpy as np
+import pandas as pd
 from PIL import Image
+from tqdm import tqdm
+
 import torch
 import open_clip
 
-# If you placed this script in tools/ and run from project root, the imports are fine.
-# If you run it from tools/, it still works because we don't import project modules here.
 
+# ------------------------- utils -------------------------
 
-# ----------------------------- Utilities -------------------------------------
-
-
-def discover_images(img_dir: str, exts: List[str]) -> List[str]:
-    files: List[str] = []
-    for ext in exts:
-        files.extend(glob.glob(os.path.join(img_dir, f"*{ext}")))
-        files.extend(glob.glob(os.path.join(img_dir, f"*{ext.upper()}")))
-    files = sorted(set(files))
-    return files
-
-
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def smart_device(override: str | None = None) -> torch.device:
-    if override:
-        return torch.device(override)
+def detect_device(device_override: Optional[str] = None) -> torch.device:
+    if device_override:
+        return torch.device(device_override)
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
 
-def l2_normalize(x: np.ndarray, axis: int = 1, eps: float = 1e-10) -> np.ndarray:
-    norm = np.linalg.norm(x, ord=2, axis=axis, keepdims=True)
-    return x / (norm + eps)
+def list_images(folder: str) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+    files = []
+    for name in sorted(os.listdir(folder)):
+        p = os.path.join(folder, name)
+        if os.path.isfile(p) and os.path.splitext(name.lower())[1] in exts:
+            files.append(p)
+    return files
 
 
-def load_external_meta(meta_path: str) -> Dict[str, Dict[str, str]]:
-    """
-    Load an external CSV (UTF-8) and map by filename (case-sensitive).
-    Assumes there is a column named `filename`.
-    """
-    table: Dict[str, Dict[str, str]] = {}
-    with open(meta_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if "filename" not in reader.fieldnames:
-            raise ValueError("External metadata CSV must contain a 'filename' column.")
-        for row in reader:
-            fn = row["filename"]
-            table[fn] = row
-    return table
+def normalize_rows(x: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+    return x / n
 
 
-# ----------------------------- Core Builder ----------------------------------
+def load_external_meta(meta_csv_path: Optional[str]) -> Optional[pd.DataFrame]:
+    """Robust CSV reader (BOM-safe, header-trim, filename normalization)."""
+    if not meta_csv_path:
+        return None
+    if not os.path.exists(meta_csv_path):
+        print(f"[WARN] metadata CSV not found: {meta_csv_path}")
+        return None
+
+    df = pd.read_csv(meta_csv_path, encoding="utf-8-sig")
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # accept 'filename' or common variants
+    if "filename" not in df.columns:
+        alt = None
+        for c in ("image", "file"):
+            if c in df.columns:
+                alt = c
+                break
+        if alt:
+            df = df.rename(columns={alt: "filename"})
+
+    if "filename" not in df.columns:
+        raise ValueError("External metadata CSV must contain a 'filename' (or 'image'/'file') column.")
+
+    df["filename"] = df["filename"].map(lambda x: os.path.basename(str(x)).strip())
+    return df
 
 
-def build_one_museum(
-    museum_folder: str,
-    clip_model: str = "ViT-B-32",
-    clip_pretrained: str = "openai",
-    device_str: str | None = None,
-    batch_size: int = 32,
-    exts: List[str] | None = None,
-    limit: int | None = None,
-    external_meta_csv: str | None = None,
-    overwrite: bool = True,
-) -> None:
-    """
-    Build embeddings for a single museum folder.
+def dual_views(preprocess, pil: Image.Image):
+    """full image + center crop (square) as a tiny augmentation ensemble."""
+    # full
+    im_full = preprocess(pil.convert("RGB"))
+    # center crop to min side (square), then preprocess again
+    w, h = pil.size
+    m = min(w, h)
+    left = (w - m) // 2
+    top = (h - m) // 2
+    pil_square = pil.crop((left, top, left + m, top + m))
+    im_square = preprocess(pil_square.convert("RGB"))
+    return im_full, im_square
 
-    Folder structure:
-        museum_folder/
-            images/
-            embeddings.npy              (output)
-            embeddings_meta.csv         (output)
 
-    Args:
-        museum_folder: path like 'data/met'
-        external_meta_csv: optional CSV to merge by `filename`
-    """
-    exts = exts or [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
-    museum_name = os.path.basename(museum_folder.rstrip("/"))
+# ------------------------- core -------------------------
 
-    img_dir = os.path.join(museum_folder, "images")
-    if not os.path.isdir(img_dir):
-        print(f"[WARN] skip {museum_name}: no images/ found at {img_dir}")
+def build_for_museum(
+    museum: str,
+    data_root: str,
+    model_name: str = "ViT-B-32",
+    pretrained: str = "openai",
+    device: Optional[str] = None,
+    meta_csv: Optional[str] = None,
+    overwrite: bool = False,
+    use_dual_view: bool = True,
+):
+    out_dir = os.path.join(data_root, museum)
+    img_dir = os.path.join(out_dir, "images")
+    os.makedirs(out_dir, exist_ok=True)
+
+    if not os.path.exists(img_dir):
+        print(f"[WARN] images folder not found: {img_dir}")
         return
 
-    out_npy = os.path.join(museum_folder, "embeddings.npy")
-    out_csv = os.path.join(museum_folder, "embeddings_meta.csv")
-    if (os.path.exists(out_npy) or os.path.exists(out_csv)) and not overwrite:
-        print(f"[SKIP] {museum_name}: outputs already exist and overwrite=False")
-        return
-
-    files = discover_images(img_dir, exts)
+    files = list_images(img_dir)
     if not files:
-        print(f"[WARN] {museum_name}: no images with {exts} under {img_dir}")
+        print(f"[WARN] no images found in: {img_dir}")
         return
-    if limit and limit > 0:
-        files = files[:limit]
 
-    device = smart_device(device_str)
-    print(f"[INFO] museum={museum_name} | images={len(files)} | device={device} | model={clip_model}/{clip_pretrained}")
+    dev = detect_device(device)
+    print(f"[INFO] museum={museum} | images={len(files)} | device={dev} | model={model_name}/{pretrained}")
 
-    # Create model
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        clip_model, pretrained=clip_pretrained, device=device
-    )
+    embed_path = os.path.join(out_dir, "embeddings.npy")
+    meta_path = os.path.join(out_dir, "embeddings_meta.csv")
+
+    if (os.path.exists(embed_path) or os.path.exists(meta_path)) and not overwrite:
+        print(f"[SKIP] embeddings/meta already exist (use --overwrite to rebuild): {out_dir}")
+        return
+
+    # model
+    model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained, device=dev)
     model.eval()
 
+    # encode
     feats = []
-    meta_rows = []
+    for p in tqdm(files, desc=f"[{museum}] progress"):
+        try:
+            pil = Image.open(p)
+        except Exception:
+            print(f"[WARN] failed to open image: {p}")
+            continue
 
-    # Batch inference
-    n = len(files)
-    steps = (n + batch_size - 1) // batch_size
-    with torch.no_grad():
-        for step in range(steps):
-            chunk = files[step * batch_size : (step + 1) * batch_size]
-            images = []
-            good_paths = []
-            for path in chunk:
-                try:
-                    img = Image.open(path).convert("RGB")
-                    images.append(preprocess(img))
-                    good_paths.append(path)
-                except Exception as e:
-                    print(f"[SKIP] {path}: {e}")
+        if use_dual_view:
+            im1, im2 = dual_views(preprocess, pil)
+            ims = torch.stack([im1, im2], dim=0).to(dev)
+        else:
+            ims = torch.stack([preprocess(pil.convert("RGB"))], dim=0).to(dev)
 
-            if not images:
-                continue
-
-            batch = torch.stack(images, dim=0).to(device)
-            emb = model.encode_image(batch)
-            emb = emb / emb.norm(dim=-1, keepdim=True)
-            emb = emb.detach().cpu().numpy().astype(np.float32)
-
-            feats.append(emb)
-            meta_rows.extend([{"filename": os.path.basename(p)} for p in good_paths])
-
-            print(f"[{museum_name}] progress: {min((step + 1) * batch_size, n)}/{n}")
+        with torch.no_grad(), torch.autocast(device_type=str(dev), enabled=(dev.type in ["cuda", "mps"])):
+            feat = model.encode_image(ims)  # (k, D)
+            feat = feat.float().cpu().numpy()
+            feat = feat.mean(axis=0, keepdims=True)  # simple average for dual view
+        feats.append(feat)
 
     if not feats:
-        print(f"[WARN] {museum_name}: no valid images processed.")
+        print(f"[WARN] no features produced for: {museum}")
         return
 
-    embs = np.concatenate(feats, axis=0)
-    embs = l2_normalize(embs, axis=1)
+    E = np.concatenate(feats, axis=0)  # (N, D)
+    E = normalize_rows(E)
+    np.save(embed_path, E)
+    print(f"[OK] {museum}: embeddings={E.shape} → {embed_path}")
 
-    # Save embeddings
-    np.save(out_npy, embs)
+    # base meta (filename only)
+    meta_rows = [{"filename": os.path.basename(p)} for p in files]
+    base_df = pd.DataFrame(meta_rows)
 
-    # Merge external metadata if provided
-    if external_meta_csv and os.path.exists(external_meta_csv):
-        try:
-            ext_map = load_external_meta(external_meta_csv)
-            # enrich rows
-            enriched = []
-            # collect all headers
-            all_keys = set(["filename"])
-            for r in meta_rows:
-                fn = r["filename"]
-                extra = ext_map.get(fn, {})
-                merged = dict(extra)
-                merged["filename"] = fn  # ensure filename is present and last write
-                enriched.append(merged)
-                all_keys.update(merged.keys())
-            fieldnames = list(all_keys)
-            # write CSV
-            with open(out_csv, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                for row in enriched:
-                    writer.writerow(row)
-        except Exception as e:
-            print(f"[WARN] failed to merge external metadata: {e}")
-            # fallback to minimal csv
-            with open(out_csv, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=["filename"])
-                writer.writeheader()
-                for row in meta_rows:
-                    writer.writerow(row)
-    else:
-        # minimal CSV (filename only)
-        with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["filename"])
-            writer.writeheader()
-            for row in meta_rows:
-                writer.writerow(row)
+    # external meta
+    ext_df = None
+    try:
+        ext_df = load_external_meta(meta_csv)
+    except Exception as e:
+        print(f"[WARN] failed to read external metadata: {e}")
 
-    print(f"[OK] {museum_name}: embeddings={embs.shape} → {out_npy}")
-    print(f"[OK] {museum_name}: meta rows={len(meta_rows)} → {out_csv}")
+    merged = base_df.merge(ext_df, on="filename", how="left") if ext_df is not None else base_df
 
-
-def build_all(
-    root: str,
-    **kwargs,
-) -> None:
-    """Iterate all subfolders under root and build embeddings for each."""
-    subs = sorted([p for p in glob.glob(os.path.join(root, "*/"))])
-    if not subs:
-        print(f"[WARN] no subfolders under {root}")
-        return
-    for folder in subs:
-        build_one_museum(folder, **kwargs)
-
-
-# ----------------------------- Entry Point -----------------------------------
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Build CLIP embeddings for data/<museum>/images/"
-    )
-    p.add_argument("--root", default="data", help="Root folder containing museum subfolders")
-    p.add_argument("--museum", default=None, help="Build only for a specific subfolder name (e.g., 'met')")
-    p.add_argument("--all", action="store_true", help="Process all subfolders under --root")
-    p.add_argument("--clip-model", default="ViT-B-32", help="CLIP model name (e.g., ViT-B-32, ViT-L-14)")
-    p.add_argument("--clip-pretrained", default="openai", help="Pretrained weights (e.g., openai, laion2b_s34b_b79k)")
-    p.add_argument("--device", default=None, help="Force device: cuda | mps | cpu (auto if omitted)")
-    p.add_argument("--batch-size", type=int, default=32, help="Batch size for embedding inference")
-    p.add_argument("--exts", default=".jpg,.jpeg,.png,.webp,.bmp", help="Comma-separated image extensions")
-    p.add_argument("--limit", type=int, default=None, help="Only process first N images (debug)")
-    p.add_argument("--meta", default=None, help="External metadata CSV to merge by `filename`")
-    p.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
-    return p.parse_args()
+    # filename first
+    cols = ["filename"] + [c for c in merged.columns if c != "filename"]
+    merged = merged[cols]
+    merged.to_csv(meta_path, index=False, encoding="utf-8")
+    print(f"[OK] {museum}: meta rows={len(merged)} → {meta_path}")
 
 
 def main():
-    args = parse_args()
-    exts = [e.strip() for e in args.exts.split(",") if e.strip()]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--museum", type=str, help="Museum folder name under data/, e.g., local / met")
+    parser.add_argument("--all", action="store_true", help="Build for all subfolders under data/")
+    parser.add_argument("--data_root", type=str, default="data")
+    parser.add_argument("--model", type=str, default="ViT-B-32")
+    parser.add_argument("--pretrained", type=str, default="openai")
+    parser.add_argument("--device", type=str, default=None, help="cuda / mps / cpu (auto if omitted)")
+    parser.add_argument("--meta", type=str, default=None, help="Optional external CSV to merge (must have filename)")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--no_dual", action="store_true", help="Disable dual-view averaging")
+    args = parser.parse_args()
 
-    kwargs = dict(
-        clip_model=args.clip_model,
-        clip_pretrained=args.clip_pretrained,
-        device_str=args.device,
-        batch_size=args.batch_size,
-        exts=exts,
-        limit=args.limit,
-        external_meta_csv=args.meta,
-        overwrite=args.overwrite,
-    )
+    if not args.museum and not args.all:
+        print("\nPlease set --museum=NAME or use --all.\n")
+        sys.exit(1)
 
     if args.all:
-        build_all(args.root, **kwargs)
+        for m in sorted(d for d in os.listdir(args.data_root)
+                        if os.path.isdir(os.path.join(args.data_root, d))):
+            build_for_museum(
+                museum=m,
+                data_root=args.data_root,
+                model_name=args.model,
+                pretrained=args.pretrained,
+                device=args.device,
+                meta_csv=args.meta,
+                overwrite=args.overwrite,
+                use_dual_view=not args.no_dual,
+            )
     else:
-        if not args.museum:
-            raise SystemExit("Please set --museum=NAME or use --all.")
-        folder = os.path.join(args.root, args.museum)
-        if not os.path.isdir(folder):
-            raise SystemExit(f"Folder not found: {folder}")
-        build_one_museum(folder, **kwargs)
+        build_for_museum(
+            museum=args.museum,
+            data_root=args.data_root,
+            model_name=args.model,
+            pretrained=args.pretrained,
+            device=args.device,
+            meta_csv=args.meta,
+            overwrite=args.overwrite,
+            use_dual_view=not args.no_dual,
+        )
 
 
 if __name__ == "__main__":

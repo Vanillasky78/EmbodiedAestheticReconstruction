@@ -1,17 +1,17 @@
-filename
-Clausen_BrownEyes.jpg
-Clausen_LadyWithDove.jpg
-Feuerbach_Nanna.jpg
-Feuerbach_Venezianerin.jpg
-Frampton_YoungWoman.jpg
-Hughes_Elaine_Launcelot.jpg
-Ingres_Moitessier_Seated.jpg
-Ingres_Moitessier_Standing.jpg
-Reynolds_LadyBampfylde.jpg
-Rossetti_BeataBeatrix.jpg
-Rossetti_Proserpine.jpg
-The Singer.jpg
-Tissot_Summer.jpg
-VigeeLeBrun_Hamilton_Sibyl.jpg
-VigeeLeBrun_Skavronskaia.jpg
-Wells_Gretchen.jpg
+year,filename,price_text,artist,title
+1886,Clausen_BrownEyes.jpg,"¥1,100,000",George Clausen,Brown Eyes
+1889,Clausen_LadyWithDove.jpg,"¥900,000",George Clausen,Lady with Dove
+1861,Feuerbach_Nanna.jpg,"¥1,900,000",Anselm Feuerbach,Nanna
+1866,Feuerbach_Venezianerin.jpg,"¥1,500,000",Anselm Feuerbach,Die Venezianerin
+1890,Frampton_YoungWoman.jpg,"¥800,000",George Frampton (attrib.),A Young Woman
+1861,Hughes_Elaine_Launcelot.jpg,"¥1,700,000",Arthur Hughes,Elaine and Lancelot
+1856,Ingres_Moitessier_Seated.jpg,"¥4,500,000",Jean-Auguste-Dominique Ingres,Madame Moitessier (Seated)
+1851,Ingres_Moitessier_Standing.jpg,"¥4,200,000",Jean-Auguste-Dominique Ingres,Madame Moitessier (Standing)
+1776,Reynolds_LadyBampfylde.jpg,"¥2,000,000",Joshua Reynolds,Lady Bampfylde
+1870,Rossetti_BeataBeatrix.jpg,"¥3,200,000",Dante Gabriel Rossetti,Beata Beatrix
+1874,Rossetti_Proserpine.jpg,"¥3,100,000",Dante Gabriel Rossetti,Proserpine
+1884,The Singer.jpg,"¥900,000",William-Adolphe Bouguereau (attrib.),The Singer
+1876,Tissot_Summer.jpg,"¥2,600,000",James Tissot,Summer (La Femme à l’ombrelle)
+1791,VigeeLeBrun_Hamilton_Sibyl.jpg,"¥2,300,000",Élisabeth Vigée Le Brun,Emma Hamilton as a Sibyl
+1796,VigeeLeBrun_Skavronskaia.jpg,"¥1,600,000",Élisabeth Vigée Le Brun,Portrait of Countess Skavronskaia
+1878,Wells_Gretchen.jpg,"¥600,000",Henry Tanworth Wells,Gretchen

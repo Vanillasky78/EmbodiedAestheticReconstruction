@@ -1,172 +1,153 @@
-# model/pose_matcher.py
-# -----------------------------------------------------------------------------
-# Embodied Aesthetic Reconstruction — PoseMatcher
-# -----------------------------------------------------------------------------
-# Core logic for multi-museum artwork retrieval.
-# Combines YOLOv8-Pose (for skeletons) and OpenCLIP embeddings for image similarity.
-# -----------------------------------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+Pose / Image matcher for EAR.
 
+Public methods:
+  - match_pil(pil, topk=3)
+  - match_image_bytes(b, topk=3)
+  - match_image_embedding(q, topk=3)
+
+Returns list of dicts: { filename, title, artist, year, score }
+"""
+
+import io
+import math
 import os
-import glob
-import warnings
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 from PIL import Image
 
-from ultralytics import YOLO
 import torch
 import open_clip
 
-from .utils import load_image_from_bytes, l2_normalize, cosine_similarity
 from ..config import Settings
 
 
+def _detect_device(pref: Optional[str] = None) -> torch.device:
+    if pref:
+        return torch.device(pref)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _nan_to_none(v):
+    try:
+        if v is None:
+            return None
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    return v
+
+
+def _l2n(x: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(x, axis=-1, keepdims=True) + 1e-12
+    return x / n
+
+
 class PoseMatcher:
-    """Main class handling YOLO-Pose + CLIP based matching."""
-
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, museum: str = "local"):
         self.settings = settings
+        self.museum = museum
 
-        # ---- Device selection ----
-        if settings.device_override:
-            self.device = torch.device(settings.device_override)
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            self.device = torch.device("mps")
+        self.data_dir = os.path.join(self.settings.data_root, museum)
+        embed_path = os.path.join(self.data_dir, "embeddings.npy")
+        meta_path = os.path.join(self.data_dir, "embeddings_meta.csv")
+
+        if not os.path.exists(embed_path):
+            raise FileNotFoundError(f"Embeddings not found: {embed_path}")
+
+        self.embeddings = np.load(embed_path).astype("float32")  # (N, D)
+        self.embeddings = _l2n(self.embeddings)
+
+        # load meta (BOM-safe), require filename
+        if os.path.exists(meta_path):
+            df = pd.read_csv(meta_path, encoding="utf-8-sig")
+            df.columns = [c.strip().lower() for c in df.columns]
         else:
-            self.device = torch.device("cpu")
+            df = pd.DataFrame({"filename": []})
 
-        # ---- YOLOv8 Pose model ----
-        model_path = settings.pose_model_path
-        self.pose = YOLO(model_path if os.path.exists(model_path) else "yolov8n-pose.pt")
+        if "filename" not in df.columns:
+            raise ValueError(f"'filename' column is required in {meta_path}")
 
-        # ---- CLIP model ----
+        self.meta_df = df
+        self.filenames = df["filename"].map(lambda x: os.path.basename(str(x))).tolist()
+
+        if len(self.filenames) != self.embeddings.shape[0]:
+            # 长度不一致不致命，但提醒修正
+            print("[WARN] embeddings and meta length mismatch; check your build step.")
+
+        # CLIP model for query encoding (when using match_pil / match_image_bytes)
+        self.device = _detect_device(self.settings.device_override)
         self.clip_model, _, self.preprocess = open_clip.create_model_and_transforms(
-            settings.clip_model_name,
-            pretrained=settings.clip_pretrained,
-            device=self.device,
+            self.settings.clip_model_name, pretrained=self.settings.clip_pretrained, device=self.device
         )
         self.clip_model.eval()
 
-        # ---- Load all museum datasets ----
-        self.datasets = self._load_museum_datasets(settings.data_root, settings.allow_museums)
-        if not self.datasets:
-            warnings.warn("⚠️ No datasets found under data_root; API will run but matching will fail.")
+    # ---------- helpers ----------
 
-    # --------------------------------------------------------------------------
-    # Public API
-    # --------------------------------------------------------------------------
-    def get_status(self) -> Dict[str, Any]:
-        """Return current model/device/data status."""
-        total = sum(len(ds["meta"]) for ds in self.datasets.values()) if self.datasets else 0
-        return {
-            "device": str(self.device),
-            "pose_model": getattr(self.pose.model, "name", "yolov8n-pose"),
-            "clip_model": f"{self.settings.clip_model_name}/{self.settings.clip_pretrained}",
-            "loaded_museums": {k: len(v["meta"]) for k, v in self.datasets.items()},
-            "total_items": total,
-        }
+    def _row_to_payload(self, idx: int, score: float) -> Dict[str, Any]:
+        d: Dict[str, Any] = {"filename": None, "title": None, "artist": None, "year": None, "score": float(score)}
+        if 0 <= idx < len(self.meta_df):
+            row = {k: _nan_to_none(v) for k, v in self.meta_df.iloc[idx].to_dict().items()}
+            d["filename"] = row.get("filename")
 
-    def list_museums(self) -> Dict[str, int]:
-        """List all loaded museum datasets."""
-        return {name: len(ds["meta"]) for name, ds in self.datasets.items()}
+            # 常见字段
+            d["title"] = row.get("title")
+            d["artist"] = row.get("artist")
 
-    def get_metadata(self, museum: str, filename: str) -> Optional[Dict[str, Any]]:
-        """Return metadata row for a given museum + filename."""
-        ds = self.datasets.get(museum)
-        if not ds:
-            return None
-        df = ds["meta"]
-        row = df.loc[df["filename"] == filename]
-        if row.empty:
-            return None
-        return row.iloc[0].to_dict()
+            y = row.get("year")
+            if y is not None:
+                try:
+                    d["year"] = int(float(y))
+                except Exception:
+                    d["year"] = None
+        return d
 
-    def match_image_bytes(self, image_bytes: bytes, museum: Optional[str] = None, topk: int = 3) -> List[Dict[str, Any]]:
-        """Main function: given an image (bytes), return Top-K most similar artworks."""
-        if not self.datasets:
-            raise ValueError("No datasets loaded. Please build embeddings first.")
+    def _topk_from_query_vec(self, q: np.ndarray, topk: int) -> List[Dict[str, Any]]:
+        # cosine sim (embeddings already L2 normalized)
+        sims = (self.embeddings @ q.reshape(-1)).astype("float32")
+        idx = np.argsort(-sims)[: int(topk)]
+        return [self._row_to_payload(int(i), float(sims[i])) for i in idx]
 
-        img: Image.Image = load_image_from_bytes(image_bytes)
+    # ---------- public APIs ----------
 
-        # 1) Pose estimation (optional)
-        try:
-            yres = self.pose.predict(source=img, verbose=False, imgsz=640)
-            keypoints = yres[0].keypoints.xy.cpu().numpy().tolist() if yres and yres[0].keypoints is not None else []
-        except Exception:
-            keypoints = []
+    def match_image_embedding(self, q: np.ndarray, topk: int = 3) -> List[Dict[str, Any]]:
+        """q: (D,) numpy vector already L2-normalized"""
+        if q.ndim != 1:
+            q = q.reshape(-1)
+        q = q.astype("float32")
+        q = _l2n(q)
+        return self._topk_from_query_vec(q, topk)
 
-        # 2) Encode image to CLIP embedding
-        with torch.no_grad():
-            t_full = self.preprocess(img).unsqueeze(0).to(self.device)
-            feat_full = self.clip_model.encode_image(t_full)
-            feat_full = feat_full / feat_full.norm(dim=-1, keepdim=True)
-            feat_full = feat_full[0].detach().cpu().numpy()
+    def _encode_pil_dual(self, pil: Image.Image) -> np.ndarray:
+        """encode a PIL to a single (D,) vector using dual-view average."""
+        # full
+        im_full = self.preprocess(pil.convert("RGB"))
+        # square center crop
+        w, h = pil.size
+        m = min(w, h)
+        pil_square = pil.crop(((w - m) // 2, (h - m) // 2, (w - m) // 2 + m, (h - m) // 2 + m))
+        im_square = self.preprocess(pil_square.convert("RGB"))
 
-            # Optional dual-view: center crop
-            if self.settings.use_dual_view:
-                w, h = img.size
-                short = min(w, h)
-                left = (w - short) // 2
-                top = (h - short) // 2
-                crop = img.crop((left, top, left + short, top + short)).resize((w, h))
-                t_crop = self.preprocess(crop).unsqueeze(0).to(self.device)
-                feat_crop = self.clip_model.encode_image(t_crop)
-                feat_crop = feat_crop / feat_crop.norm(dim=-1, keepdim=True)
-                feat_crop = feat_crop[0].detach().cpu().numpy()
-                feat = (feat_full + feat_crop) / 2.0
-            else:
-                feat = feat_full
+        ims = torch.stack([im_full, im_square], dim=0).to(self.device)
+        with torch.no_grad(), torch.autocast(device_type=str(self.device), enabled=(self.device.type in ["cuda", "mps"])):
+            feat = self.clip_model.encode_image(ims)  # (2, D)
+            feat = feat.float().cpu().numpy().mean(axis=0)  # (D,)
+        return _l2n(feat)
 
-        query = l2_normalize(feat, axis=0)  # (D,)
+    def match_pil(self, pil: Image.Image, topk: int = 3) -> List[Dict[str, Any]]:
+        q = self._encode_pil_dual(pil)
+        return self._topk_from_query_vec(q, topk)
 
-        # 3) Compute cosine similarity per museum
-        museums = [museum] if museum else list(self.datasets.keys())
-        all_hits = []
-
-        for m in museums:
-            ds = self.datasets.get(m)
-            if not ds:
-                continue
-            embs = ds["embeddings"]  # (N, D)
-            sims = cosine_similarity(embs, query)  # (N,)
-            idxs = np.argsort(-sims)[:max(1, topk)]
-            for rank, i in enumerate(idxs):
-                rec = ds["meta"].iloc[int(i)].to_dict()
-                all_hits.append({
-                    "museum": m,
-                    "rank": rank + 1,
-                    "similarity": float(sims[i]),
-                    **rec,
-                    "keypoints": keypoints if rank == 0 else None,
-                })
-
-        all_hits.sort(key=lambda x: x["similarity"], reverse=True)
-        return all_hits[:max(1, topk)]
-
-    # --------------------------------------------------------------------------
-    # Internal helpers
-    # --------------------------------------------------------------------------
-    def _load_museum_datasets(self, base: str, allow: Optional[List[str]]):
-        """Scan data/<museum>/ for embeddings and metadata files."""
-        datasets = {}
-        subdirs = sorted([p for p in glob.glob(os.path.join(base, "*/"))])
-        for folder in subdirs:
-            name = os.path.basename(os.path.dirname(folder))
-            if allow and name not in allow:
-                continue
-            emb = os.path.join(folder, "embeddings.npy")
-            meta = os.path.join(folder, "embeddings_meta.csv")
-            if os.path.exists(emb) and os.path.exists(meta):
-                embs = np.load(emb)
-                embs = embs.astype(np.float32)
-                norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-10
-                embs = embs / norms  # ensure normalized
-                datasets[name] = {
-                    "embeddings": embs,
-                    "meta": pd.read_csv(meta),
-                }
-        return datasets
+    def match_image_bytes(self, b: bytes, topk: int = 3) -> List[Dict[str, Any]]:
+        pil = Image.open(io.BytesIO(b))
+        return self.match_pil(pil, topk=topk)
