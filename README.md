@@ -183,3 +183,42 @@ EAR System Architecture Diagram (Text Layout)
 │  - data/local/embeddings_meta.csv
 │  - metadata: artist, title, year, etc.
 └────────────────────────────┘
+
+EmbodiedAestheticReconstruction/
+│
+├── backend/                           ✅ FastAPI 后端
+│   ├── __init__.py
+│   ├── main.py                         ✅ 主入口（启动 FastAPI）
+│   ├── config.py                       ✅ 全局配置
+│   ├── requirements.txt
+│   ├── model/                          ✅ 核心算法（姿态匹配）
+│   │   ├── __init__.py
+│   │   ├── pose_matcher.py
+│   │   ├── utils.py
+│   │   └── yolov8n-pose.pt
+│   └── tools/                          ✅ 工具脚本
+│       ├── build_embeddings.py
+│       └── （其他辅助脚本）
+│
+├── data/
+│   ├── local/                          ✅ 当前使用的 museum 数据源
+│   │   ├── images/                     ✅ 作品图片（16张）
+│   │   ├── embeddings.npy              ✅ 向量文件（勿删）
+│   │   ├── embeddings_meta.csv         ✅ 自动生成的索引（勿删）
+│   │   └── portrait_works.csv          ✅ 你手动编辑的元数据（主文件）
+│   └── （可选其他 museum，如 met/ tate）
+│
+├── frontend/                           ✅ Streamlit 前端
+│   ├── app_frontend.py                 ✅ 主界面
+│   ├── app_curatorial.py               （可保留备用）
+│   ├── requirements.txt
+│   └── .streamlit/                     ✅ 配置文件（可选）
+│
+├── scripts/                            ✅ 环境与检测工具
+│   ├── setup_check.py
+│   ├── start_local.sh                  ✅ 可选一键启动脚本（Mac）
+│   └── start_local.bat                 ✅ 可选一键启动脚本（Windows）
+│
+├── README.md                           ✅ 工程说明
+├── environment.yml                     ✅ Conda 环境配置
+└── .gitignore                          ✅ 忽略文件
