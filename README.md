@@ -222,3 +222,13 @@ EmbodiedAestheticReconstruction/
 ├── README.md                           ✅ 工程说明
 ├── environment.yml                     ✅ Conda 环境配置
 └── .gitignore                          ✅ 忽略文件
+
+
+重新启动后端
+
+uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+
+
+启动前端
+
+streamlit run frontend/app_frontend.py
