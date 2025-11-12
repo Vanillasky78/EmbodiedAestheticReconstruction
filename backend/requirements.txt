@@ -27,3 +27,4 @@ torchvision==0.18.1
 
 # --- Optional Utilities (recommended for extended scripts) ---
 tqdm==4.66.4     # progress bars in build_embeddings.py
+python-multipart==0.0.9

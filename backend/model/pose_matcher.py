@@ -20,7 +20,7 @@ import torch
 import open_clip
 
 from .utils import load_image_from_bytes, l2_normalize, cosine_similarity
-from config import Settings
+from ..config import Settings
 
 
 class PoseMatcher:
