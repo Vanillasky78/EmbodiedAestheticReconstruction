@@ -1,19 +1,42 @@
-# backend/main.py
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+"""
+EAR Backend API (FastAPI + Uvicorn)
+
+Exposes:
+- GET  /health     → quick status check
+- POST /match      → upload an image and get Top-K matched artworks
+
+It uses the PoseMatcher defined in backend/model/pose_matcher.py and the
+Settings from backend/config.py.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+from typing import List, Optional
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
-from io import BytesIO
 from PIL import Image
 
-# 相对导入
 from .config import Settings
 from .model.pose_matcher import PoseMatcher
 
-cfg = Settings()
-app = FastAPI(title="EAR API", version="1.0.0")
 
-# CORS（前端跨域时可用）
+logger = logging.getLogger("uvicorn.error")
+
+# ----------------------------------------------------------------------
+# FastAPI app + CORS
+# ----------------------------------------------------------------------
+
+app = FastAPI(
+    title="Embodied Aesthetic Reconstruction — Backend API",
+    version="0.1.0",
+    description="CLIP-based portrait → artwork matching backend.",
+)
+
+# Allow everything locally; you can tighten this later if needed.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,122 +45,211 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 全局单例
+# Global objects filled at startup
+settings: Optional[Settings] = None
 matcher: Optional[PoseMatcher] = None
 
 
-class MatchItem(BaseModel):
+# ----------------------------------------------------------------------
+# Startup / shutdown
+# ----------------------------------------------------------------------
+
+
+@app.on_event("startup")
+def _startup_load() -> None:
+    """Load configuration + matcher once when the server starts."""
+    global settings, matcher
+
+    logger.info("Loading Settings and PoseMatcher…")
+    settings = Settings()
+    matcher = PoseMatcher(settings)
+    logger.info("Matcher loaded successfully.")
+
+
+@app.on_event("shutdown")
+def _shutdown_cleanup() -> None:
+    """Optional cleanup (currently nothing special)."""
+    global matcher
+    matcher = None
+    logger.info("Matcher released.")
+
+
+# ----------------------------------------------------------------------
+# Simple health endpoint
+# ----------------------------------------------------------------------
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "device": getattr(matcher, "device", "unknown") if matcher else "unloaded",
+        "default_museum": getattr(settings, "default_museum", None)
+        if settings
+        else None,
+    }
+
+
+# ----------------------------------------------------------------------
+# Schemas for /match
+# ----------------------------------------------------------------------
+
+
+class MatchResult(BaseModel):
     filename: str
     title: Optional[str] = None
     artist: Optional[str] = None
-    year: Optional[str] = None
+    year: Optional[int] = None
     score: float
 
 
 class MatchResponse(BaseModel):
-    museum: str
+    museum: Optional[str]
     topk: int
-    results: List[MatchItem]
+    results: List[MatchResult]
 
 
-@app.on_event("startup")
-def _startup_load():
-    """
-    兼容两种 PoseMatcher 写法：
-    1) 新版：PoseMatcher(data_root=..., clip_model=..., ...)
-    2) 旧版：PoseMatcher(settings=Settings())
-    """
-    global matcher
-    try:
-        # 优先尝试新版签名（如果你的 pose_matcher 是我给的新版）
-        matcher = PoseMatcher(
-            data_root=cfg.data_root,
-            clip_model=cfg.clip_model_name,
-            clip_pretrained=cfg.clip_pretrained,
-            device_override=cfg.device_override,
-            use_dual_view=cfg.use_dual_view,
-            verbose=cfg.verbose,
-        )
-    except TypeError:
-        # 回退到旧版签名（你当前环境就是这种）
-        matcher = PoseMatcher(settings=cfg)
-
-
-@app.get("/status")
-def status():
-    if matcher is None:
-        raise HTTPException(status_code=503, detail="Matcher not initialized")
-
-    # 兼容属性名差异
-    device = getattr(matcher, "device_str", None) or str(getattr(matcher, "device", "cpu"))
-    museums_loaded = getattr(matcher, "museums_loaded", None)
-    if museums_loaded is None and hasattr(matcher, "museums"):
-        museums_loaded = list(getattr(matcher, "museums").keys())
-
-    items_total = getattr(matcher, "items_total", None)
-    if items_total is None and hasattr(matcher, "museums"):
-        total = 0
-        for m in matcher.museums.values():
-            embs = m.get("embeddings")
-            if embs is not None:
-                total += int(getattr(embs, "shape", [0])[0] if hasattr(embs, "shape") else len(embs))
-        items_total = total
-
-    return {
-        "museums_loaded": museums_loaded,
-        "items_total": items_total,
-        "device": device,
-        "clip": f"{cfg.clip_model_name}/{cfg.clip_pretrained}",
-    }
+# ----------------------------------------------------------------------
+# Main matching endpoint
+# ----------------------------------------------------------------------
 
 
 @app.post("/match", response_model=MatchResponse)
 async def match(
-    file: UploadFile = File(...),
-    topk: int = Query(default=cfg.topk_default, ge=1, le=20),
-    museum: Optional[str] = Query(default=None, description="e.g., local / met / tate"),
+    image: UploadFile = File(..., description="Uploaded portrait photo"),
+    museum: Optional[str] = Form(None, description="Museum name, e.g. local / met"),
+    topk: int = Form(3, description="Number of top results"),
 ):
-    if matcher is None:
-        raise HTTPException(status_code=503, detail="Matcher not initialized")
+    """
+    Robust matching endpoint:
 
-    # 读取上传图像
-    raw = await file.read()
+    - validates that the uploaded file looks like an image
+    - decodes it to a PIL image (RGB)
+    - calls PoseMatcher.match_pil(...)
+    - tries to back-fill missing title / artist / year from matcher.meta_by_filename
+    """
+    # ----------------- basic validation -----------------
+    if topk <= 0:
+        topk = 3
+
+    if image.content_type is not None and not image.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported content type: {image.content_type}. Please upload an image file.",
+        )
+
+    data = await image.read()
+    if not data:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty file received. Please take a photo again.",
+        )
+
+    # ----------------- decode to PIL -----------------
     try:
-        img = Image.open(BytesIO(raw)).convert("RGB")
+        pil_img = Image.open(io.BytesIO(data)).convert("RGB")
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid image: {exc}")
+        logger.exception("Failed to decode uploaded image")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid image file: {type(exc).__name__}",
+        )
 
-    # 兼容两种匹配 API：match_pil(...) 或 match_image_bytes(...)
+    # ----------------- check matcher -----------------
+    global matcher
+    if matcher is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Matcher is not loaded on the server.",
+        )
+
+    effective_museum = museum or getattr(matcher, "default_museum", None) or "local"
+
+    # ----------------- run matcher -----------------
     try:
         if hasattr(matcher, "match_pil"):
-            results = matcher.match_pil(img, topk=topk, museum=museum)
-        elif hasattr(matcher, "match_image_bytes"):
-            results = matcher.match_image_bytes(raw, museum=museum, topk=topk)
+            raw_results = matcher.match_pil(
+                pil_img,
+                museum=effective_museum,
+                topk=topk,
+            )
         else:
-            raise RuntimeError("PoseMatcher has neither match_pil nor match_image_bytes.")
+            raise RuntimeError("PoseMatcher has no method 'match_pil'")
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        logger.exception("ValueError in matcher.match_pil")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Matching failed: {exc}",
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Matching failed: {exc}")
+        logger.exception("Unhandled error in matcher.match_pil")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal error during matching: {type(exc).__name__}: {exc}",
+        )
 
-    # 兼容结果字段名（dict/list of objects）
-    payload: List[MatchItem] = []
-    for r in results:
+    # ----------------- normalize results structure -----------------
+    payload: List[MatchResult] = []
+
+    meta_store = getattr(matcher, "meta_by_filename", None)
+
+    def fill_from_meta(filename: str, title, artist, year):
+        """If title/artist/year are missing, try to fill from matcher metadata."""
+        nonlocal meta_store
+        if not isinstance(meta_store, dict):
+            return title, artist, year
+
+        meta = meta_store.get(filename) or meta_store.get(filename.strip()) or {}
+        if isinstance(meta, dict):
+            title = title or meta.get("title") or meta.get("Title")
+            artist = artist or meta.get("artist") or meta.get("Artist")
+            year = year or meta.get("year") or meta.get("Year")
+        else:
+            title = title or getattr(meta, "title", None)
+            artist = artist or getattr(meta, "artist", None)
+            year = year or getattr(meta, "year", None)
+        return title, artist, year
+
+    for r in raw_results or []:
         if isinstance(r, dict):
-            filename = r.get("filename", "")
+            filename = r.get("filename") or r.get("file") or ""
+            score = float(r.get("score", 0.0))
             title = r.get("title")
             artist = r.get("artist")
             year = r.get("year")
-            score = float(r.get("score") or r.get("similarity") or 0.0)
         else:
-            # 如果是对象，尽量取属性
-            filename = getattr(r, "filename", "")
+            filename = getattr(r, "filename", "") or getattr(r, "file", "")
+            score = float(getattr(r, "score", 0.0))
             title = getattr(r, "title", None)
             artist = getattr(r, "artist", None)
             year = getattr(r, "year", None)
-            score = float(getattr(r, "score", getattr(r, "similarity", 0.0)))
-        payload.append(MatchItem(filename=filename, title=title, artist=artist, year=year, score=score))
 
-    # 默认馆名：优先入参，否则读取 matcher.default_museum
-    default_museum = getattr(matcher, "default_museum", None)
-    return MatchResponse(museum=museum or default_museum or "local", topk=topk, results=payload)
+        title, artist, year = fill_from_meta(filename, title, artist, year)
+
+        # normalise year → int or None
+        year_int: Optional[int]
+        try:
+            if isinstance(year, str) and year.strip():
+                year_int = int(year.split(",")[0].strip())
+            elif isinstance(year, (int, float)):
+                year_int = int(year)
+            else:
+                year_int = None
+        except Exception:
+            year_int = None
+
+        payload.append(
+            MatchResult(
+                filename=filename,
+                title=title,
+                artist=artist,
+                year=year_int,
+                score=float(score),
+            )
+        )
+
+    return MatchResponse(
+        museum=effective_museum,
+        topk=topk,
+        results=payload,
+    )

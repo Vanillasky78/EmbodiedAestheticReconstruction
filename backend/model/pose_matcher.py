@@ -1,153 +1,193 @@
-# -*- coding: utf-8 -*-
 """
-Pose / Image matcher for EAR.
+PoseMatcher
 
-Public methods:
-  - match_pil(pil, topk=3)
-  - match_image_bytes(b, topk=3)
-  - match_image_embedding(q, topk=3)
+A lightweight CLIP-based matcher that:
 
-Returns list of dicts: { filename, title, artist, year, score }
+- loads pre-computed embeddings from data/local/embeddings.npy
+- loads metadata from data/local/embeddings_meta.csv
+- computes an embedding for the query image
+- returns the Top-K most similar artworks with their metadata
+
+This version does NOT depend on YOLO pose directly; it only uses
+the CLIP image encoder. You already created the embeddings with:
+
+    python backend/tools/build_embeddings.py --museum local ...
+
+So this matcher just consumes those files.
 """
 
-import io
-import math
-import os
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
-import pandas as pd
+import open_clip
+import torch
 from PIL import Image
 
-import torch
-import open_clip
-
-from ..config import Settings
+from backend.config import Settings
 
 
-def _detect_device(pref: Optional[str] = None) -> torch.device:
-    if pref:
-        return torch.device(pref)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def _nan_to_none(v):
-    try:
-        if v is None:
-            return None
-        if isinstance(v, float) and math.isnan(v):
-            return None
-        if pd.isna(v):
-            return None
-    except Exception:
-        pass
-    return v
-
-
-def _l2n(x: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(x, axis=-1, keepdims=True) + 1e-12
-    return x / n
+@dataclass
+class MatchItem:
+    filename: str
+    title: Optional[str]
+    artist: Optional[str]
+    year: Optional[int]
+    score: float
 
 
 class PoseMatcher:
-    def __init__(self, settings: Settings, museum: str = "local"):
+    def __init__(self, settings: Settings):
         self.settings = settings
-        self.museum = museum
 
-        self.data_dir = os.path.join(self.settings.data_root, museum)
-        embed_path = os.path.join(self.data_dir, "embeddings.npy")
-        meta_path = os.path.join(self.data_dir, "embeddings_meta.csv")
-
-        if not os.path.exists(embed_path):
-            raise FileNotFoundError(f"Embeddings not found: {embed_path}")
-
-        self.embeddings = np.load(embed_path).astype("float32")  # (N, D)
-        self.embeddings = _l2n(self.embeddings)
-
-        # load meta (BOM-safe), require filename
-        if os.path.exists(meta_path):
-            df = pd.read_csv(meta_path, encoding="utf-8-sig")
-            df.columns = [c.strip().lower() for c in df.columns]
+        # --------- Resolve device ----------
+        if settings.device == "cpu":
+            device = "cpu"
+        elif settings.device == "cuda" and torch.cuda.is_available():
+            device = "cuda"
+        elif settings.device == "mps" and torch.backends.mps.is_available():
+            device = "mps"
         else:
-            df = pd.DataFrame({"filename": []})
+            # "auto" or unsupported → try CUDA, then MPS, then CPU
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
 
-        if "filename" not in df.columns:
-            raise ValueError(f"'filename' column is required in {meta_path}")
+        self.device = torch.device(device)
 
-        self.meta_df = df
-        self.filenames = df["filename"].map(lambda x: os.path.basename(str(x))).tolist()
-
-        if len(self.filenames) != self.embeddings.shape[0]:
-            # 长度不一致不致命，但提醒修正
-            print("[WARN] embeddings and meta length mismatch; check your build step.")
-
-        # CLIP model for query encoding (when using match_pil / match_image_bytes)
-        self.device = _detect_device(self.settings.device_override)
-        self.clip_model, _, self.preprocess = open_clip.create_model_and_transforms(
-            self.settings.clip_model_name, pretrained=self.settings.clip_pretrained, device=self.device
+        # --------- Load CLIP model ----------
+        # It must match the model used in build_embeddings.py
+        self.model, self.preprocess, _ = open_clip.create_model_and_transforms(
+            "ViT-B-32",
+            pretrained="openai",
+            device=self.device,
         )
-        self.clip_model.eval()
+        self.model.eval()
 
-    # ---------- helpers ----------
+        # --------- Load stored embeddings ----------
+        emb_path = settings.embeddings_path
+        if not emb_path.exists():
+            raise FileNotFoundError(f"Embeddings file not found: {emb_path}")
 
-    def _row_to_payload(self, idx: int, score: float) -> Dict[str, Any]:
-        d: Dict[str, Any] = {"filename": None, "title": None, "artist": None, "year": None, "score": float(score)}
-        if 0 <= idx < len(self.meta_df):
-            row = {k: _nan_to_none(v) for k, v in self.meta_df.iloc[idx].to_dict().items()}
-            d["filename"] = row.get("filename")
+        # shape: (N, D)
+        emb_np = np.load(emb_path)
+        if isinstance(emb_np, np.lib.npyio.NpzFile):
+            # Just in case someone saved np.savez
+            # we expect a "embeddings" key
+            emb_np = emb_np["embeddings"]
 
-            # 常见字段
-            d["title"] = row.get("title")
-            d["artist"] = row.get("artist")
+        # Store as normalized torch tensor on device
+        emb = torch.from_numpy(emb_np).float()
+        emb = emb / (emb.norm(dim=-1, keepdim=True) + 1e-8)
+        self.embeddings = emb.to(self.device)
 
-            y = row.get("year")
-            if y is not None:
-                try:
-                    d["year"] = int(float(y))
-                except Exception:
-                    d["year"] = None
-        return d
+        # --------- Load metadata ----------
+        meta_path = settings.embeddings_meta_path
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Metadata CSV not found: {meta_path}")
 
-    def _topk_from_query_vec(self, q: np.ndarray, topk: int) -> List[Dict[str, Any]]:
-        # cosine sim (embeddings already L2 normalized)
-        sims = (self.embeddings @ q.reshape(-1)).astype("float32")
-        idx = np.argsort(-sims)[: int(topk)]
-        return [self._row_to_payload(int(i), float(sims[i])) for i in idx]
+        self.meta: List[Dict] = []
+        self.meta_by_filename: Dict[str, Dict] = {}
 
-    # ---------- public APIs ----------
+        with meta_path.open("r", encoding="utf-8") as f:
+            header = f.readline().strip().split(",")
+            # Simple CSV reader; no quoted commas expected here
+            for line in f:
+                parts = [p.strip() for p in line.strip().split(",")]
+                if not parts or not parts[0]:
+                    continue
+                row = dict(zip(header, parts))
+                filename = row.get("filename") or row.get("file") or ""
+                if not filename:
+                    continue
 
-    def match_image_embedding(self, q: np.ndarray, topk: int = 3) -> List[Dict[str, Any]]:
-        """q: (D,) numpy vector already L2-normalized"""
-        if q.ndim != 1:
-            q = q.reshape(-1)
-        q = q.astype("float32")
-        q = _l2n(q)
-        return self._topk_from_query_vec(q, topk)
+                # Normalize year to int if possible
+                raw_year = row.get("year") or row.get("Year")
+                year_int: Optional[int] = None
+                if raw_year:
+                    try:
+                        year_int = int(str(raw_year).split(",")[0].strip())
+                    except Exception:
+                        year_int = None
 
-    def _encode_pil_dual(self, pil: Image.Image) -> np.ndarray:
-        """encode a PIL to a single (D,) vector using dual-view average."""
-        # full
-        im_full = self.preprocess(pil.convert("RGB"))
-        # square center crop
-        w, h = pil.size
-        m = min(w, h)
-        pil_square = pil.crop(((w - m) // 2, (h - m) // 2, (w - m) // 2 + m, (h - m) // 2 + m))
-        im_square = self.preprocess(pil_square.convert("RGB"))
+                meta_entry = {
+                    "filename": filename,
+                    "title": row.get("title") or row.get("Title"),
+                    "artist": row.get("artist") or row.get("Artist"),
+                    "year": year_int,
+                    # Keep raw dict as well in case we need extra columns later
+                    **row,
+                }
+                self.meta.append(meta_entry)
+                self.meta_by_filename[filename] = meta_entry
 
-        ims = torch.stack([im_full, im_square], dim=0).to(self.device)
-        with torch.no_grad(), torch.autocast(device_type=str(self.device), enabled=(self.device.type in ["cuda", "mps"])):
-            feat = self.clip_model.encode_image(ims)  # (2, D)
-            feat = feat.float().cpu().numpy().mean(axis=0)  # (D,)
-        return _l2n(feat)
+        # For compatibility with the backend/main.py code
+        self.default_museum = settings.default_museum
 
-    def match_pil(self, pil: Image.Image, topk: int = 3) -> List[Dict[str, Any]]:
-        q = self._encode_pil_dual(pil)
-        return self._topk_from_query_vec(q, topk)
+    # ------------------------------------------------------------------
+    # Core API used both by backend and Streamlit frontend
+    # ------------------------------------------------------------------
+    def _encode_image(self, image: Image.Image) -> torch.Tensor:
+        """Encode a PIL image into a normalized CLIP embedding."""
+        img = self.preprocess(image).unsqueeze(0).to(self.device)  # (1, 3, H, W)
+        with torch.no_grad():
+            feat = self.model.encode_image(img)  # (1, D)
+        feat = feat / (feat.norm(dim=-1, keepdim=True) + 1e-8)
+        return feat  # (1, D)
 
-    def match_image_bytes(self, b: bytes, topk: int = 3) -> List[Dict[str, Any]]:
-        pil = Image.open(io.BytesIO(b))
-        return self.match_pil(pil, topk=topk)
+    def match_pil(
+        self,
+        image: Image.Image,
+        museum: Optional[str] = None,
+        topk: int = 3,
+    ) -> List[Dict]:
+        """
+        Match a PIL image against the stored embeddings.
+
+        Returns a list of dicts:
+            { "filename": ..., "title": ..., "artist": ..., "year": ..., "score": ... }
+        """
+        if topk <= 0:
+            topk = 3
+
+        # Encode query
+        query = self._encode_image(image)  # (1, D)
+
+        # Cosine similarity with all stored embeddings
+        # Because both are normalized, dot-product == cosine
+        sims = (self.embeddings @ query.T).squeeze(1)  # (N,)
+
+        # Top-K indices
+        k = min(topk, sims.shape[0])
+        scores, indices = torch.topk(sims, k=k, largest=True, sorted=True)
+
+        results: List[Dict] = []
+        for score, idx in zip(scores.tolist(), indices.tolist()):
+            # index into meta list; we assume same order as embeddings
+            if 0 <= idx < len(self.meta):
+                meta = self.meta[idx]
+            else:
+                meta = {}
+
+            filename = meta.get("filename", "")
+            title = meta.get("title")
+            artist = meta.get("artist")
+            year = meta.get("year")
+
+            results.append(
+                {
+                    "filename": filename,
+                    "title": title,
+                    "artist": artist,
+                    "year": year,
+                    "score": float(score),
+                }
+            )
+
+        return results
