@@ -1,7 +1,18 @@
+# frontend/app_frontend_final.py
+#
+# Embodied Aesthetic Reconstruction — Final Frontend
+# Layout: two wide columns
+#   Left  : live camera + YOLOv8-Pose skeleton overlay
+#   Right : matched artworks from backend /match API
+#
+# Requirements (in your ear-mvp env):
+#   pip install streamlit streamlit-webrtc ultralytics pillow numpy requests av opencv-python
+
 import io
 import json
+import threading
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import av
 import cv2
@@ -11,397 +22,400 @@ from PIL import Image, ImageDraw, ImageFont
 
 import streamlit as st
 from streamlit_webrtc import (
-    webrtc_streamer,
-    WebRtcMode,
     RTCConfiguration,
     VideoProcessorBase,
+    WebRtcMode,
+    webrtc_streamer,
 )
 
 from ultralytics import YOLO
 
-# ==== Paths ====
+# ---------- Paths ----------
 FRONTEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = FRONTEND_DIR.parent
 DATA_DIR = ROOT_DIR / "data"
-LOCAL_IMAGES_DIR = DATA_DIR / "local" / "images"
-LOCAL_META_CSV = DATA_DIR / "local" / "embeddings_meta.csv"
 
-DEFAULT_MUSEUM = "local"
+DEFAULT_API_URL = "http://127.0.0.1:8000/match"
+DEFAULT_MUSEUM_KEY = "local"
+DEFAULT_TOPK = 3
+
 YOLO_MODEL_PATH = FRONTEND_DIR / "yolov8n-pose.pt"
 
 RTC_CONFIGURATION = RTCConfiguration(
-    {
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302"]}
-        ]
-    }
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
+# ---------- Fonts & drawing helpers ----------
 
-# ==== Metadata helpers ====
 
-@st.cache_data(show_spinner=False)
-def load_metadata(csv_path: Path) -> Dict[str, Dict]:
+@st.cache_resource(show_spinner=False)
+def load_font(size: int = 36) -> ImageFont.FreeTypeFont:
     """
-    Load metadata CSV as a dict keyed by filename.
+    Try to load a Courier-like monospaced font.
+    If not found, fall back to default PIL font.
     """
-    import csv
-
-    meta: Dict[str, Dict] = {}
-    if not csv_path.exists():
-        return meta
-
-    with csv_path.open("r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            filename = (row.get("filename") or "").strip()
-            if not filename:
-                continue
-            meta[filename] = row
-    return meta
-
-
-def format_price(meta_row: Dict) -> Optional[str]:
-    """
-    优先使用 price_text，如果没有再尝试 auction_price_usd。
-    """
-    price_text = (meta_row.get("price_text") or "").strip()
-    auction_price = (meta_row.get("auction_price_usd") or "").strip()
-
-    if price_text:
-        return price_text
-    if auction_price:
-        # 简单格式化一下，例如 4500000 -> "¥4,500,000"
+    candidates = [
+        "Courier New.ttf",
+        "Courier New Bold.ttf",
+        "CourierPrime-Regular.ttf",
+        "Menlo.ttc",
+        "Monaco.ttf",
+    ]
+    for name in candidates:
         try:
-            val = float(auction_price)
-            return f"¥{val:,.0f}"
+            return ImageFont.truetype(name, size=size)
         except Exception:
-            return auction_price
-    return None
+            continue
+    return ImageFont.load_default()
 
 
-def draw_price_year_artist_label(
+def overlay_price_year_artist(
     img: Image.Image,
-    meta_row: Dict,
+    artist: Optional[str],
+    year: Optional[str],
+    price_text: Optional[str],
 ) -> Image.Image:
     """
-    在图像上叠加三条黄色标签（从上到下）：
-    1. 价格
-    2. 年份
-    3. 艺术家
+    Draw three yellow bars on top of the artwork:
+      1) price_text
+      2) year
+      3) artist
+    All in Courier-like font, black text.
     """
+    img = img.convert("RGB")
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
 
-    # 取字段
-    price_text = format_price(meta_row) or "N/A"
-    year_text = (meta_row.get("year") or "").strip() or "Unknown year"
-    artist_text = (meta_row.get("artist") or "").strip() or "Unknown artist"
+    # Font sizes relative to image height
+    font_large = load_font(max(int(h * 0.055), 18))  # price & artist
+    font_medium = load_font(max(int(h * 0.045), 16))  # year
 
-    W, H = img.size
-    draw = ImageDraw.Draw(img, "RGBA")
+    padding_x = int(w * 0.025)
+    padding_y = int(h * 0.012)
+    gap_y = int(h * 0.012)
 
-    # 字体：优先 Courier / Courier New，失败就用默认
-    def _get_font(size: int) -> ImageFont.FreeTypeFont:
-        for name in ["Courier New", "Courier"]:
-            try:
-                return ImageFont.truetype(name, size=size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
+    def _draw_bar(text: str, y: int, font: ImageFont.FreeTypeFont) -> int:
+        if not text:
+            return y
+        text = str(text)
+        tw, th = draw.textsize(text, font=font)
+        box = (
+            padding_x,
+            y,
+            padding_x + tw + padding_x * 2,
+            y + th + padding_y * 2,
+        )
+        draw.rectangle(box, fill=(255, 230, 0))
+        text_x = padding_x + padding_x * 0.7
+        text_y = y + padding_y * 0.9
+        draw.text((text_x, text_y), text, font=font, fill=(0, 0, 0))
+        return y + th + padding_y * 2 + gap_y
 
-    font_big = _get_font(size=int(H * 0.045))
-    font_mid = _get_font(size=int(H * 0.035))
-
-    # 三行文本
-    line1 = price_text
-    line2 = str(year_text)
-    line3 = artist_text
-
-    # 计算每行文本宽度
-    pad_x = int(W * 0.02)
-    pad_y = int(H * 0.008)
-
-    w1, h1 = draw.textsize(line1, font=font_big)
-    w2, h2 = draw.textsize(line2, font=font_mid)
-    w3, h3 = draw.textsize(line3, font=font_big)
-
-    box_width = max(w1, w2, w3) + pad_x * 2
-
-    # 从图像左下角往上堆叠三条
-    margin_bottom = int(H * 0.06)
-    gap = int(H * 0.008)
-
-    y3_bottom = H - margin_bottom
-    y3_top = y3_bottom - h3 - pad_y * 2
-
-    y2_bottom = y3_top - gap
-    y2_top = y2_bottom - h2 - pad_y * 2
-
-    y1_bottom = y2_top - gap
-    y1_top = y1_bottom - h1 - pad_y * 2
-
-    x_left = int(W * 0.02)
-    x_right = x_left + box_width
-
-    # 统一用亮黄色
-    yellow = (255, 230, 0, 255)
-
-    # 绘制矩形 + 文本
-    def _draw_box(y_top, y_bottom, text, font):
-        draw.rectangle([x_left, y_top, x_right, y_bottom], fill=yellow)
-        text_w, text_h = draw.textsize(text, font=font)
-        text_x = x_left + pad_x
-        text_y = y_top + (y_bottom - y_top - text_h) / 2
-        draw.text((text_x, text_y), text, font=font, fill=(0, 0, 0, 255))
-
-    _draw_box(y1_top, y1_bottom, line1, font_big)
-    _draw_box(y2_top, y2_bottom, line2, font_mid)
-    _draw_box(y3_top, y3_bottom, line3, font_big)
+    # place bars in lower-left quadrant
+    current_y = int(h * 0.65)
+    current_y = _draw_bar(price_text or "", current_y, font_large)
+    current_y = _draw_bar(
+        str(year) if year not in (None, "", "None") else "", current_y, font_medium
+    )
+    _draw_bar(artist or "", current_y, font_large)
 
     return img
 
 
-# ==== YOLO Video Processor ====
+def find_artwork_image(filename: str, museum_key: str) -> Optional[Path]:
+    """
+    Robustly resolve artwork image path.
+    We try several fallbacks to avoid crashes.
+    """
+    if not filename:
+        return None
 
-class YoloPoseProcessor(VideoProcessorBase):
+    museum_key_str = str(museum_key).strip() if museum_key else DEFAULT_MUSEUM_KEY
+    candidate_paths = [
+        DATA_DIR / museum_key_str / "images" / filename,
+        DATA_DIR / "local" / "images" / filename,
+        DATA_DIR / "images" / filename,
+    ]
+
+    for p in candidate_paths:
+        if p.is_file():
+            return p
+    return None
+
+
+def format_price(result: Dict) -> Optional[str]:
+    """
+    Choose a displayable price string:
+    1) 'price_text' if present (e.g. '¥4,500,000')
+    2) formatted 'auction_price_usd' if numeric
+    """
+    if result.get("price_text"):
+        return str(result["price_text"])
+
+    value = result.get("auction_price_usd")
+    if isinstance(value, (int, float)):
+        # your dataset uses yuan-like notation, but we keep '¥' as per your design
+        return f"¥{value:,.0f}"
+    return None
+
+
+# ---------- YOLOv8 Pose video processor ----------
+
+
+class PoseVideoProcessor(VideoProcessorBase):
     def __init__(self) -> None:
-        super().__init__()
-        self.model: Optional[YOLO] = None
+        self.lock = threading.Lock()
         self.latest_frame_bgr: Optional[np.ndarray] = None
 
-    def _ensure_model(self):
-        if self.model is None:
-            self.model = YOLO(str(YOLO_MODEL_PATH))
+        # Load YOLO model once (cached in process)
+        self.model = YOLO(str(YOLO_MODEL_PATH))
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img_bgr = frame.to_ndarray(format="bgr24")
-        self.latest_frame_bgr = img_bgr.copy()
+        img = frame.to_ndarray(format="bgr24")
 
-        self._ensure_model()
-        results = self.model(img_bgr, verbose=False)
+        # Save a copy of the raw frame for later "instant capture"
+        with self.lock:
+            self.latest_frame_bgr = img.copy()
 
-        if not results:
-            return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
+        # Run pose detection
+        results = self.model(img, verbose=False)
+        annotated = img.copy()
 
-        res = results[0]
-        annotated = img_bgr.copy()
+        for r in results:
+            if r.boxes is None or r.keypoints is None:
+                continue
 
-        if res.boxes is not None and len(res.boxes) > 0:
-            for box in res.boxes:
-                xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                conf = float(box.conf[0].cpu().numpy())
-                x1, y1, x2, y2 = xyxy.tolist()
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 255, 0), 2)
-                cv2.putText(
-                    annotated,
-                    f"person {conf:.2f}",
-                    (x1, max(y1 - 5, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-        if res.keypoints is not None and res.keypoints.xy is not None:
-            kps = res.keypoints.xy.cpu().numpy()  # [num_person, num_kpts, 2]
-            for person_kps in kps:
-                for x, y in person_kps:
-                    cv2.circle(
+            # Draw bounding boxes
+            if r.boxes.xyxy is not None and len(r.boxes.xyxy) > 0:
+                for box, conf in zip(r.boxes.xyxy, r.boxes.conf):
+                    x1, y1, x2, y2 = box.int().tolist()
+                    cv2.rectangle(
+                        annotated, (x1, y1), (x2, y2), (255, 0, 0), 2
+                    )  # blue
+                    label = f"person {float(conf):.2f}"
+                    cv2.putText(
                         annotated,
-                        (int(x), int(y)),
-                        4,
-                        (0, 255, 0),
-                        -1,
+                        label,
+                        (x1, max(y1 - 10, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 0, 0),
+                        2,
+                        cv2.LINE_AA,
                     )
+
+            # Draw keypoints skeleton
+            if r.keypoints is not None and r.keypoints.xy is not None:
+                kps = r.keypoints.xy[0].cpu().numpy().astype(int)
+                for x, y in kps:
+                    cv2.circle(annotated, (x, y), 4, (0, 255, 0), -1)
 
         return av.VideoFrame.from_ndarray(annotated, format="bgr24")
 
+    def get_latest_frame(self) -> Optional[np.ndarray]:
+        with self.lock:
+            if self.latest_frame_bgr is None:
+                return None
+            return self.latest_frame_bgr.copy()
 
-# ==== Streamlit Layout ====
 
-st.set_page_config(
-    page_title="EAR — Skeleton Frontend (Final)",
-    layout="wide",
-)
+# ---------- API call & result rendering ----------
 
-st.markdown(
-    "<h1 style='font-size:40px;'>Embodied Aesthetic Reconstruction — Final Frontend</h1>",
-    unsafe_allow_html=True,
-)
-st.markdown(
-    "<p style='font-size:18px; color:#555;'>"
-    "Left: camera view with YOLOv8-Pose skeleton overlay. "
-    "Right: matched artworks via API, with price / year / artist labels."
-    "</p>",
-    unsafe_allow_html=True,
-)
 
-# Sidebar: matching settings
-with st.sidebar:
-    st.header("Matching Settings")
+def call_match_api(
+    api_url: str,
+    frame_bgr: np.ndarray,
+    museum_key: str,
+    topk: int,
+    timeout: float = 30.0,
+) -> Dict:
+    """
+    Send current frame to backend /match API and return JSON response.
+    """
+    # Encode frame as JPEG
+    success, encoded = cv2.imencode(".jpg", frame_bgr)
+    if not success:
+        raise RuntimeError("Failed to encode frame as JPEG.")
+    img_bytes = encoded.tobytes()
 
-    api_url = st.text_input(
-        "API URL",
-        value="http://127.0.0.1:8000/match",
-        help="Your FastAPI /match endpoint.",
-    )
+    data = {
+        "museum": str(museum_key),
+        "topk": str(int(topk)),
+    }
+    files = {"image": ("frame.jpg", img_bytes, "image/jpeg")}
 
-    museum_key = st.text_input(
-        "Museum key (e.g., local / met)",
-        value=DEFAULT_MUSEUM,
-    )
+    resp = requests.post(api_url, data=data, files=files, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
 
-    topk = st.number_input(
-        "Top-K matches",
-        min_value=1,
-        max_value=10,
-        value=3,
-        step=1,
+
+def render_results_column(
+    col,
+    payload: Optional[Dict],
+    museum_key: str,
+) -> None:
+    """
+    Render matched artworks (payload from backend) in the right column.
+    """
+    if not payload:
+        col.info("No matching results yet. Capture a frame from the camera to start.")
+        return
+
+    results: List[Dict] = payload.get("results", []) or []
+    museum = payload.get("museum", museum_key)
+
+    if not results:
+        col.warning("Backend returned an empty result list.")
+        return
+
+    for rank, r in enumerate(results, start=1):
+        filename = r.get("filename") or r.get("file") or ""
+        title = r.get("title") or "(Untitled)"
+        artist = r.get("artist") or ""
+        year = r.get("year")
+        score = r.get("score", 0.0)
+        price = format_price(r)
+
+        col.markdown("---")
+        col.markdown(f"### #{rank}: {title}")
+
+        # Load and render artwork image
+        img_path = find_artwork_image(filename, museum)
+        if img_path is None:
+            col.error(
+                f"Failed to load image **{filename}** for museum key **{museum}**."
+            )
+        else:
+            try:
+                pil_img = Image.open(img_path).convert("RGB")
+                pil_img = overlay_price_year_artist(
+                    pil_img, artist=artist, year=year, price_text=price
+                )
+                col.image(pil_img, use_container_width=True)
+            except Exception as exc:
+                col.error(
+                    f"Error while rendering image **{filename}**: {exc}",
+                )
+
+        # Text metadata
+        meta_lines = []
+        if artist:
+            meta_lines.append(f"- **Artist:** {artist}")
+        if year not in (None, "", "None"):
+            meta_lines.append(f"- **Year:** {year}")
+        meta_lines.append(f"- **Score:** {float(score):.3f}")
+        if filename:
+            meta_lines.append(f"- **Filename:** `{filename}`")
+
+        license_ = r.get("license")
+        museum_label = r.get("museum") or museum
+        significance = r.get("significance_text")
+        if museum_label:
+            meta_lines.append(f"- **Collection / Museum:** {museum_label}")
+        if license_:
+            meta_lines.append(f"- **License:** {license_}")
+
+        if meta_lines:
+            col.markdown("\n".join(meta_lines))
+
+        if significance:
+            col.markdown(f"> {significance}")
+
+
+# ---------- Streamlit main ----------
+
+
+def main():
+    st.set_page_config(
+        page_title="EAR — Final Frontend",
+        layout="wide",
     )
 
     st.markdown(
-        "<p style='font-size:12px;color:#777;'>"
-        "Tip: If the API is running on another machine, update the URL accordingly."
-        "</p>",
+        "<h1 style='text-align: center;'>Embodied Aesthetic Reconstruction — Final Frontend</h1>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<p style='text-align: center;'>Left: live camera with YOLOv8-Pose skeleton. "
+        "Right: matched artworks from the CLIP-based backend API.</p>",
         unsafe_allow_html=True,
     )
 
-# Main two-column layout (camera left, artworks right)
-col_left, col_right = st.columns(2, gap="large")
+    # --- Settings row (top, not sidebar) ---
+    st.markdown("### Matching settings")
+    c1, c2, c3 = st.columns([3, 2, 1])
 
-# ---- Left: camera & skeleton ----
-with col_left:
-    st.subheader("Camera · Skeleton View")
+    with c1:
+        api_url = st.text_input("API URL", value=DEFAULT_API_URL)
+    with c2:
+        museum_key = st.text_input("Museum key (e.g. local / met)", value=DEFAULT_MUSEUM_KEY)
+    with c3:
+        topk = st.number_input("Top-K matches", min_value=1, max_value=10, value=DEFAULT_TOPK)
 
-    webrtc_ctx = webrtc_streamer(
-        key="ear-skeleton-final",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": True, "audio": False},
-        video_processor_factory=YoloPoseProcessor,
-        async_processing=True,
+    st.markdown("---")
+
+    # --- Two main columns: left = camera, right = artworks ---
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.subheader("Live pose view")
+
+        webrtc_ctx = webrtc_streamer(
+            key="ear-final-webrtc",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={"video": True, "audio": False},
+            video_processor_factory=PoseVideoProcessor,
+        )
+
+        st.markdown("")
+        capture_btn = st.button("⚡ Instant capture & match", use_container_width=True)
+        st.caption(
+            "Tip: hold your pose, then click the button to send the current frame to the backend."
+        )
+
+    # Use session_state to preserve last payload
+    if "last_match_payload" not in st.session_state:
+        st.session_state["last_match_payload"] = None
+
+    # When button pressed, call backend
+    if capture_btn:
+        if webrtc_ctx and webrtc_ctx.state.playing and webrtc_ctx.video_processor:
+            frame = webrtc_ctx.video_processor.get_latest_frame()
+            if frame is None:
+                st.warning("No frame captured yet. Please wait a second and try again.")
+            else:
+                try:
+                    with st.spinner("Sending current frame to backend and waiting for matches..."):
+                        payload = call_match_api(
+                            api_url=api_url,
+                            frame_bgr=frame,
+                            museum_key=museum_key,
+                            topk=int(topk),
+                        )
+                    st.session_state["last_match_payload"] = payload
+                except requests.RequestException as exc:
+                    st.error(f"Request to backend failed: {exc}")
+                except Exception as exc:
+                    st.error(f"Unexpected error while calling backend: {exc}")
+        else:
+            st.warning("Camera is not running yet. Please allow camera access and start the stream.")
+
+    # --- Right column: render matches (using last payload from state) ---
+    with col_right:
+        st.subheader("Matched artworks")
+        render_results_column(
+            col_right,
+            st.session_state.get("last_match_payload"),
+            museum_key=museum_key,
+        )
+
+    st.markdown("---")
+    st.caption(
+        "EAR Final Frontend — left: YOLOv8-Pose skeleton; right: CLIP-based artwork matches "
+        "with price/year/artist overlays."
     )
 
-    analyze_btn = st.button("Analyze current frame", type="primary")
 
-# ---- Right: results ----
-with col_right:
-    st.subheader("Matched Artworks")
-
-    result_placeholder = st.empty()
-
-    # 处理分析按钮
-    if analyze_btn:
-        if not webrtc_ctx or not webrtc_ctx.video_processor:
-            result_placeholder.error("Camera not ready. Please allow camera access and try again.")
-        else:
-            processor: YoloPoseProcessor = webrtc_ctx.video_processor
-            if processor.latest_frame_bgr is None:
-                result_placeholder.error("No frame captured yet. Please wait for camera to start.")
-            else:
-                frame_bgr = processor.latest_frame_bgr
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(frame_rgb)
-
-                buf = io.BytesIO()
-                pil_img.save(buf, format="JPEG", quality=95)
-                buf.seek(0)
-
-                data = {
-                    "museum": museum_key or DEFAULT_MUSEUM,
-                    "topk": str(int(topk)),
-                }
-
-                # 关键：后端字段名是 "image"
-                files = {
-                    "image": ("frame.jpg", buf, "image/jpeg"),
-                }
-
-                try:
-                    resp = requests.post(api_url, data=data, files=files, timeout=90)
-                except Exception as exc:
-                    result_placeholder.error(f"Request failed: {exc}")
-                else:
-                    if resp.status_code != 200:
-                        result_placeholder.error(
-                            f"Server returned {resp.status_code}: {resp.text}"
-                        )
-                    else:
-                        payload = resp.json()
-                        # 安全兜底
-                        results: List[Dict] = payload.get("results") or []
-                        museum_used = payload.get("museum", museum_key)
-
-                        meta_map = load_metadata(LOCAL_META_CSV)
-
-                        blocks = []
-                        for idx, r in enumerate(results):
-                            filename = r.get("filename") or ""
-                            score = float(r.get("score") or 0.0)
-
-                            # 合并元数据
-                            meta = dict(meta_map.get(filename, {}))
-                            for k in ["title", "artist", "year", "price_text",
-                                      "auction_price_usd", "license", "museum"]:
-                                if r.get(k) is not None:
-                                    meta[k] = r.get(k)
-
-                            title = meta.get("title") or filename
-                            artist = meta.get("artist") or "Unknown artist"
-                            year = meta.get("year") or "Unknown year"
-
-                            img_path = LOCAL_IMAGES_DIR / filename
-
-                            # 构建展示块
-                            block_html = f"<h4>#{idx+1}: {title}</h4>"
-                            block_html += "<ul>"
-                            block_html += f"<li><b>Artist:</b> {artist}</li>"
-                            block_html += f"<li><b>Year:</b> {year}</li>"
-                            block_html += f"<li><b>Score:</b> {score:.3f}</li>"
-                            block_html += f"<li><b>Filename:</b> {filename}</li>"
-                            block_html += "</ul>"
-
-                            blocks.append((img_path, meta, block_html))
-
-                        # 在 placeholder 中实际渲染
-                        with result_placeholder.container():
-                            st.markdown(
-                                f"<p style='font-size:14px;color:#666;'>"
-                                f"Museum key: <b>{museum_used}</b> · Top-{len(blocks)} matches"
-                                f"</p>",
-                                unsafe_allow_html=True,
-                            )
-
-                            for img_path, meta, html in blocks:
-                                st.markdown("---")
-                                cols_img, cols_meta = st.columns([2, 1])
-
-                                with cols_img:
-                                    if img_path.exists():
-                                        try:
-                                            img = Image.open(img_path).convert("RGB")
-                                            img = draw_price_year_artist_label(img, meta)
-                                            st.image(
-                                                img,
-                                                use_column_width=True,
-                                                caption=img_path.name,
-                                            )
-                                        except Exception as exc:
-                                            st.error(f"Failed to load image {img_path.name}: {exc}")
-                                    else:
-                                        st.warning(f"Image not found: {img_path.name}")
-
-                                with cols_meta:
-                                    st.markdown(html, unsafe_allow_html=True)
-
-                            if not blocks:
-                                st.info("No results returned from API.")
-
-
-# 一点底部说明
-st.markdown(
-    "<hr/><p style='font-size:12px;color:#999;'>"
-    "EAR Final Frontend — camera + skeleton on the left, CLIP-based artwork matches on the right."
-    "</p>",
-    unsafe_allow_html=True,
-)
+if __name__ == "__main__":
+    main()
