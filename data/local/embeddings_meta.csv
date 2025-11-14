@@ -1,17 +1,17 @@
-year,filename,price_text,artist,title
-1886,Clausen_BrownEyes.jpg,"¥1,100,000",George Clausen,Brown Eyes
-1889,Clausen_LadyWithDove.jpg,"¥900,000",George Clausen,Lady with Dove
-1861,Feuerbach_Nanna.jpg,"¥1,900,000",Anselm Feuerbach,Nanna
-1866,Feuerbach_Venezianerin.jpg,"¥1,500,000",Anselm Feuerbach,Die Venezianerin
-1890,Frampton_YoungWoman.jpg,"¥800,000",George Frampton (attrib.),A Young Woman
-1861,Hughes_Elaine_Launcelot.jpg,"¥1,700,000",Arthur Hughes,Elaine and Lancelot
-1856,Ingres_Moitessier_Seated.jpg,"¥4,500,000",Jean-Auguste-Dominique Ingres,Madame Moitessier (Seated)
-1851,Ingres_Moitessier_Standing.jpg,"¥4,200,000",Jean-Auguste-Dominique Ingres,Madame Moitessier (Standing)
-1776,Reynolds_LadyBampfylde.jpg,"¥2,000,000",Joshua Reynolds,Lady Bampfylde
-1870,Rossetti_BeataBeatrix.jpg,"¥3,200,000",Dante Gabriel Rossetti,Beata Beatrix
-1874,Rossetti_Proserpine.jpg,"¥3,100,000",Dante Gabriel Rossetti,Proserpine
-1884,The Singer.jpg,"¥900,000",William-Adolphe Bouguereau (attrib.),The Singer
-1876,Tissot_Summer.jpg,"¥2,600,000",James Tissot,Summer (La Femme à l’ombrelle)
-1791,VigeeLeBrun_Hamilton_Sibyl.jpg,"¥2,300,000",Élisabeth Vigée Le Brun,Emma Hamilton as a Sibyl
-1796,VigeeLeBrun_Skavronskaia.jpg,"¥1,600,000",Élisabeth Vigée Le Brun,Portrait of Countess Skavronskaia
-1878,Wells_Gretchen.jpg,"¥600,000",Henry Tanworth Wells,Gretchen
+filename,title,artist,year,price_text
+Clausen_BrownEyes.jpg,Brown Eyes,George Clausen,1886,"¥1,100,000"
+Clausen_LadyWithDove.jpg,Lady with Dove,George Clausen,1889,"¥900,000"
+Feuerbach_Nanna.jpg,Nanna,Anselm Feuerbach,1861,"¥1,900,000"
+Feuerbach_Venezianerin.jpg,Die Venezianerin,Anselm Feuerbach,1866,"¥1,500,000"
+Frampton_YoungWoman.jpg,A Young Woman,George Frampton (attrib.),1890,"¥800,000"
+Hughes_Elaine_Launcelot.jpg,Elaine and Lancelot,Arthur Hughes,1861,"¥1,700,000"
+Ingres_Moitessier_Seated.jpg,Madame Moitessier (Seated),Jean-Auguste-Dominique Ingres,1856,"¥4,500,000"
+Ingres_Moitessier_Standing.jpg,Madame Moitessier (Standing),Jean-Auguste-Dominique Ingres,1851,"¥4,200,000"
+Reynolds_LadyBampfylde.jpg,Lady Bampfylde,Joshua Reynolds,1776,"¥2,000,000"
+Rossetti_BeataBeatrix.jpg,Beata Beatrix,Dante Gabriel Rossetti,1870,"¥3,200,000"
+Rossetti_Proserpine.jpg,Proserpine,Dante Gabriel Rossetti,1874,"¥3,100,000"
+The Singer.jpg,The Singer,William-Adolphe Bouguereau (attrib.),1884,"¥900,000"
+Tissot_Summer.jpg,Summer (La Femme à l’ombrelle),James Tissot,1876,"¥2,600,000"
+VigeeLeBrun_Hamilton_Sibyl.jpg,Emma Hamilton as a Sibyl,Élisabeth Vigée Le Brun,1791,"¥2,300,000"
+VigeeLeBrun_Skavronskaia.jpg,Portrait of Countess Skavronskaia,Élisabeth Vigée Le Brun,1796,"¥1,600,000"
+Wells_Gretchen.jpg,Gretchen,Henry Tanworth Wells,1878,"¥600,000"
