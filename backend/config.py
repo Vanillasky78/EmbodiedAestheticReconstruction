@@ -15,7 +15,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 class Settings(BaseModel):
     # Root folder that contains embeddings + metadata + images
-    data_root: Path = PROJECT_ROOT / "data" / "local"
+    # Use the global mixed index (local + met)
+    data_root: Path = PROJECT_ROOT / "data" / "mixed"
+
 
     # Default museum name used when the frontend does not specify one
     default_museum: str = "local"

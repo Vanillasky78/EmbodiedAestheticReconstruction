@@ -449,8 +449,10 @@ header, footer, [data-testid="stToolbar"] {{ visibility: hidden !important; }}
 .right-col .art-wrap img {{
   display: block;
   width: 100% !important;
-  height: auto !important;
+  height: 100% !important;
+  object-fit: cover !important;
 }}
+
 </style>
 """,
     unsafe_allow_html=True,
@@ -575,43 +577,61 @@ with right:
         elif "error" in payload:
             ph.error(f"Error from backend: {payload['error']}")
         else:
+                    payload = st.session_state.get("last_match")
+
+        if not payload:
+            ph.info("Hold still or press capture to trigger matching…")
+        elif "error" in payload:
+            ph.error(f"Error from backend: {payload['error']}")
+        else:
             results = payload.get("results") or []
             if not results:
                 ph.warning("No matches returned from backend.")
             else:
-                # 只取 Top-1，展陈效果更干净
-                top = results[0]
-                filename = top.get("filename") or top.get("file")
+                # --- NEW: loop over all Top-K results instead of only results[0] ---
+                metrics = st.session_state.get("last_metrics") or []
 
-                img_path = ensure_image_path(filename or "")
-                if not img_path:
-                    ph.error(f"Image file not found for: {filename}")
-                else:
-                    painting = safe_open_image(img_path)
-                    if painting is None:
-                        ph.error(f"Failed to open image: {img_path}")
-                    else:
+                # 用一个容器承载多张图，纵向排布
+                with ph.container():
+                    for i, item in enumerate(results, start=1):
+                        filename = item.get("filename") or item.get("file")
+                        if not filename:
+                            continue
+
+                        img_path = ensure_image_path(filename)
+                        if not img_path:
+                            st.error(f"[{i}] Image file not found for: {filename}")
+                            continue
+
+                        painting = safe_open_image(img_path)
+                        if painting is None:
+                            st.error(f"[{i}] Failed to open image: {img_path}")
+                            continue
+
                         # 从本地 CSV 查补充 meta
                         meta_row = lookup_meta(str(filename))
                         meta = {
-                            "artist": meta_row.get("artist") or top.get("artist") or "artist name",
-                            "year": meta_row.get("year") or top.get("year") or "",
+                            "artist": meta_row.get("artist")
+                            or item.get("artist")
+                            or "artist name",
+                            "year": meta_row.get("year")
+                            or item.get("year")
+                            or "",
                             "price_text": meta_row.get("price_text")
                             or meta_row.get("auction_price_usd")
                             or "",
                         }
 
                         painted = overlay_right_labels(painting, meta)
-
-                        # 把抓拍时的姿态指标叠到右上角（粉色文本）
-                        metrics = st.session_state.get("last_metrics") or []
                         painted = draw_tiny_metrics_top_right(
                             painted, metrics, size=16, margin=12
                         )
 
                         w = min(RIGHT_IMG_MAXW, painted.width)
-                        caption = f"{meta_row.get('title','')} — {meta.get('artist','')}"
-                        ph.image(painted, caption=caption, width=w)
+                        title = meta_row.get("title", "") or item.get("title", "")
+                        caption = f"#{i} {title} — {meta.get('artist','')}"
+                        st.image(painted, caption=caption, width=w)
+                        st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
 
     st.markdown("</div>", unsafe_allow_html=True)  # /art-wrap
     st.markdown("</div>", unsafe_allow_html=True)  # /right-col
