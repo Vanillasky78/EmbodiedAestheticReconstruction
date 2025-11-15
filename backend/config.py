@@ -1,39 +1,31 @@
-"""
-Global configuration for the EAR backend.
+# config.py
+from dataclasses import dataclass, field
+from typing import List, Optional
 
-This file defines a simple Settings model that knows where your
-data lives (embeddings, metadata CSV, images directory) and which
-device to use for inference.
-"""
+@dataclass
+class Settings:
+    """
+    Global configuration for the multi-museum backend.
+    """
 
-from pathlib import Path
-from pydantic import BaseModel
+    # === Core paths ===
+    data_root: str = "data"                         # Root folder containing museum subfolders
+    pose_model_path: str = "models/yolov8n-pose.pt" # Optional; Ultralytics will auto-download if missing
 
+    # === CLIP embedding model ===
+    clip_model_name: str = "ViT-B-32"               # Model architecture
+    clip_pretrained: str = "openai"                 # Pretrained weights source
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    # === Museum selection ===
+    allow_museums: Optional[List[str]] = field(default=None)  # Restrict loading to specific subfolders
 
+    # === Matching parameters ===
+    topk_default: int = 3                           # Default number of matches returned
+    use_dual_view: bool = True                      # Whether to use dual-view (full + crop)
+    stillness_threshold_sec: float = 3.5            # Reserved for real-time mode
 
-class Settings(BaseModel):
-    # Root folder that contains embeddings + metadata + images
-    data_root: Path = PROJECT_ROOT / "data" / "local"
+    # === Logging / Debug ===
+    verbose: bool = False                           # Toggle debug output
 
-    # Default museum name used when the frontend does not specify one
-    default_museum: str = "local"
-
-    # Device: "auto", "cpu", "cuda", "mps"
-    device: str = "auto"
-
-    class Config:
-        arbitrary_types_allowed = True
-
-    @property
-    def embeddings_path(self) -> Path:
-        return self.data_root / "embeddings.npy"
-
-    @property
-    def embeddings_meta_path(self) -> Path:
-        return self.data_root / "embeddings_meta.csv"
-
-    @property
-    def images_dir(self) -> Path:
-        return self.data_root / "images"
+    # === Device override ===
+    device_override: Optional[str] = None           # Manually force device ("cpu", "cuda", "mps")
