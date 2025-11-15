@@ -13,14 +13,19 @@ from pydantic import BaseModel
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 class Settings(BaseModel):
-    # Root folder that contains embeddings + metadata + images
-    # Use the global mixed index (local + met)
+    # 使用混合索引：local + met
     data_root: Path = PROJECT_ROOT / "data" / "mixed"
 
+    # 默认“馆”名随便写，但统一一下
+    default_museum: str = "mixed"
 
-    # Default museum name used when the frontend does not specify one
-    default_museum: str = "local"
+    # Device: "auto", "cpu", "cuda", "mps"
+    device: str = "auto"
+
 
     # Device: "auto", "cpu", "cuda", "mps"
     device: str = "auto"

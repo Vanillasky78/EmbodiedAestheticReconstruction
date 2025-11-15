@@ -20,35 +20,36 @@ from streamlit_webrtc import (
     webrtc_streamer,
 )
 
-# =================== 路径与常量 ===================
+# =================== PATHS & CONSTANTS ===================
 
 FRONTEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = FRONTEND_DIR.parent
 
-# 本地数据（用于根据 filename 找 meta）
-DATA_DIR = ROOT_DIR / "data" / "local"
+# Use global mixed data (local + met)
+DATA_DIR = ROOT_DIR / "data" / "mixed"
 IMAGES_DIR = DATA_DIR / "images"
 
-# 可能存在的 meta CSV
+# Meta CSVs: prefer mixed embeddings_meta, then fall back to local CSVs
 META_CSV_CANDIDATES = [
-    DATA_DIR / "portrait_works_enhanced_english.csv",
-    DATA_DIR / "portrait_works.csv",
+    DATA_DIR / "embeddings_meta.csv",
+    ROOT_DIR / "data" / "local" / "portrait_works_enhanced_english.csv",
+    ROOT_DIR / "data" / "local" / "portrait_works.csv",
 ]
 
-# 后端 API（需要时你可以改成 HuggingFace 地址）
+# Backend API
 DEFAULT_API_URL = "http://127.0.0.1:8000/match"
 
 APP_TITLE = "Embodied Aesthetic Reconstruction"
 
-# YOLOv8-Pose 模型路径（放在 frontend 目录下）
+# YOLOv8-Pose model path (placed in frontend/)
 YOLO_MODEL_PATH = FRONTEND_DIR / "yolov8n-pose.pt"
 
-# WebRTC 配置（Safari 需要 STUN）
+# WebRTC config (Safari needs STUN)
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
-# Stillness 检测（与策展版一致）
+# Stillness detection
 STILLNESS_SEC = 3.5
 MAX_BUF_SEC = 5.0
 FPS_ASSUMED = 12
@@ -56,22 +57,22 @@ MOTION_EPS_CXCY = 4.0
 MOTION_EPS_AREA = 0.03
 MIN_FACE_AREA = 0.06
 
-# 颜色
+# Colors
 YELLOW = (255, 235, 59)
 BLACK = (0, 0, 0)
 HOT_PINK = (255, 30, 180)
 
-# 展示区域宽度
+# Right image max display width
 RIGHT_IMG_MAXW = 900
 
 
-# =================== 小工具函数 ===================
+# =================== META & IMAGE HELPERS ===================
 
 _META_CACHE: Optional[Dict[str, Dict]] = None
 
 
 def load_meta_mapping() -> Dict[str, Dict]:
-    """加载本地 CSV，按 filename 建立索引。"""
+    """Load CSV metadata and index by filename."""
     global _META_CACHE
     if _META_CACHE is not None:
         return _META_CACHE
@@ -113,7 +114,7 @@ def safe_open_image(p: Path) -> Optional[Image.Image]:
 
 
 def ensure_image_path(filename: str) -> Optional[Path]:
-    """根据 filename 在 IMAGES_DIR 里找到图片。"""
+    """Resolve filename inside IMAGES_DIR."""
     if not filename:
         return None
     p = Path(filename)
@@ -122,8 +123,11 @@ def ensure_image_path(filename: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
+# =================== DRAWING HELPERS ===================
+
+
 def _load_font(size: int = 40) -> ImageFont.FreeTypeFont:
-    """优先用 Courier / Courier New，找不到再退回 Arial / 默认。"""
+    """Prefer Courier / Courier New, fall back to Arial / default."""
     candidates = [
         "/Library/Fonts/Courier New.ttf",
         "/System/Library/Fonts/Courier.dfont",
@@ -143,7 +147,7 @@ def _load_font(size: int = 40) -> ImageFont.FreeTypeFont:
 def draw_tiny_metrics_top_right(
     im: Image.Image, lines: List[str], size: int = 16, margin: int = 10
 ) -> Image.Image:
-    """右上角粉色文字：姿态指标（与策展版一致）。"""
+    """Draw tiny pink pose metrics in the top-right corner."""
     if not lines:
         return im
     img = im.copy()
@@ -180,12 +184,12 @@ def _elbow_angle(shoulder, elbow, wrist):
     n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
     if n1 < 1e-5 or n2 < 1e-5:
         return None
-    cosv = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+    cosv = np.clip(np.dot(v1, n2 and v2) / (n1 * n2), -1.0, 1.0)
     return float(np.degrees(np.arccos(cosv)))
 
 
 def format_metrics(kps: Dict[int, Tuple[float, float] | None]) -> List[str]:
-    """把关键点变成几行小字（与策展版同样结构）。"""
+    """Convert keypoints into several formatted lines."""
     le, re = kps.get(1), kps.get(2)
     lsh, rsh = kps.get(5), kps.get(6)
     lel, rel = kps.get(7), kps.get(8)
@@ -206,11 +210,11 @@ def format_metrics(kps: Dict[int, Tuple[float, float] | None]) -> List[str]:
 
 def overlay_right_labels(painting: Image.Image, meta: Dict) -> Image.Image:
     """
-    在画作上叠加 3 个黄色矩形标签：
-    1. 价格（price_text / auction_price_usd）
-    2. 年份（year）
-    3. 艺术家（artist）
-    字体：Courier，黑字，黄色背景，顺序固定。
+    Overlay 3 yellow rectangular labels on the artwork:
+      1. price (price_text / auction_price_usd)
+      2. year
+      3. artist
+    Font: Courier, black text on yellow background.
     """
     im = painting.convert("RGB").copy()
     draw = ImageDraw.Draw(im)
@@ -231,11 +235,9 @@ def overlay_right_labels(painting: Image.Image, meta: Dict) -> Image.Image:
     fonts = [font_big, font_small, font_big]
 
     margin_x = 24
-    # 从画面中部略靠上开始
     y = int(im.height * 0.50)
 
     for text, font in zip(lines, fonts):
-        # 用 textbbox，避免 textsize 报错
         l, t, r, b = draw.textbbox((0, 0), text, font=font)
         w, h = r - l, b - t
 
@@ -261,7 +263,7 @@ def force_rerun():
             pass
 
 
-# =================== YOLO 视频处理（完全沿用策展骨架风格） ===================
+# =================== YOLO VIDEO PROCESSOR ===================
 
 try:
     from ultralytics import YOLO
@@ -273,10 +275,7 @@ except Exception:
 
 class CuratorialProcessor(VideoProcessorBase):
     """
-    与策展版一致：
-    - 使用 YOLOv8-Pose 绘制蓝色框 + 绿色骨架
-    - 右上角粉色文本显示姿态指标
-    - 支持自动静止抓拍 & 手动抓拍
+    YOLOv8-Pose overlay + stillness detection + capture.
     """
 
     def __init__(self):
@@ -368,7 +367,7 @@ class CuratorialProcessor(VideoProcessorBase):
             return False
 
     def _stamp_capture(self):
-        """把当前帧与当前指标作为一次抓拍。"""
+        """Save current frame and metrics as a capture."""
         self.captured_img = Image.fromarray(self.latest_rgb)
         self.captured_ts = time.time()
         self.captured_metrics = list(self.last_metrics_lines)
@@ -391,7 +390,7 @@ class CuratorialProcessor(VideoProcessorBase):
 
         if self.model:
             res = self.model.predict(img_rgb, imgsz=640, device="cpu", verbose=False)
-            plotted = res[0].plot()[:, :, ::-1]  # YOLO 自带蓝框+绿骨架
+            plotted = res[0].plot()[:, :, ::-1]
             kps = self._extract_keypoints(res)
             lines = format_metrics(kps)
             with self.lock:
@@ -414,17 +413,17 @@ class CuratorialProcessor(VideoProcessorBase):
         return av.VideoFrame.from_ndarray(out_bgr, format="bgr24")
 
 
-# =================== Streamlit 页面（策展布局） ===================
+# =================== STREAMLIT LAYOUT ===================
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-# 简单 CSS：两列结构，左摄像头竖屏居中，右图像区域固定宽度
 st.markdown(
     f"""
 <style>
 section[data-testid="stSidebar"] {{ display: none !important; }}
 header, footer, [data-testid="stToolbar"] {{ visibility: hidden !important; }}
 .block-container {{ padding-top: 0.6rem; padding-bottom: 0.6rem; max-width: 1700px; }}
+
 .left-col .cam-wrap {{
   position: relative;
   height: 92vh;
@@ -439,6 +438,7 @@ header, footer, [data-testid="stToolbar"] {{ visibility: hidden !important; }}
   object-fit: cover !important;
   border-radius: 12px !important;
 }}
+
 .right-col .art-wrap {{
   position: relative;
   height: 92vh;
@@ -452,7 +452,6 @@ header, footer, [data-testid="stToolbar"] {{ visibility: hidden !important; }}
   height: 100% !important;
   object-fit: cover !important;
 }}
-
 </style>
 """,
     unsafe_allow_html=True,
@@ -461,10 +460,10 @@ header, footer, [data-testid="stToolbar"] {{ visibility: hidden !important; }}
 st.title(APP_TITLE)
 st.caption(
     "Hold still for ~3–5 seconds to auto-capture, or press the button to capture on demand. "
-    "Left: live with pose. Right: matched artwork with tiny pink metrics."
+    "Left: live with pose. Right: single matched artwork with tiny pink metrics."
 )
 
-# 尝试轻微自动刷新，让自动抓拍时右侧自动更新
+# Slight auto-refresh so right side updates after capture
 try:
     st.autorefresh(interval=700, key="ear_auto", limit=None)
 except Exception:
@@ -474,16 +473,16 @@ left, right = st.columns([1, 1], gap="large")
 
 if "countdown_target" not in st.session_state:
     st.session_state["countdown_target"] = None
-
 if "last_match" not in st.session_state:
-    st.session_state["last_match"] = None  # 保存最后一次 API 返回内容
+    st.session_state["last_match"] = None
 if "last_metrics" not in st.session_state:
     st.session_state["last_metrics"] = []
 if "last_ts" not in st.session_state:
     st.session_state["last_ts"] = 0.0
 
-API_URL = DEFAULT_API_URL  # 如果你希望在 UI 里可编辑，也可以做成 text_input
+API_URL = DEFAULT_API_URL
 
+# ------------------- LEFT: LIVE CAMERA -------------------
 
 with left:
     st.subheader("Live")
@@ -512,7 +511,7 @@ with left:
                 ok = ctx.video_processor.capture_now()
                 st.toast("Captured." if ok else "No frame yet, try again.", icon="✅" if ok else "⚠️")
 
-    # 倒计时逻辑
+    # Countdown logic
     if st.session_state["countdown_target"]:
         remain = st.session_state["countdown_target"] - time.time()
         if remain > 0:
@@ -526,6 +525,7 @@ with left:
 
     st.markdown("</div>", unsafe_allow_html=True)  # /left-col
 
+# ------------------- RIGHT: MATCHED ARTWORK (TOP-1) -------------------
 
 with right:
     st.subheader("Matched artwork")
@@ -541,24 +541,24 @@ with right:
     if not proc:
         ph.info("Initializing camera…")
     else:
-        # 从处理器读取最新抓拍
+        # Read latest capture from processor
         with proc.lock:
             cap_img = proc.captured_img
             cap_ts = getattr(proc, "captured_ts", 0.0)
             cap_metrics = list(getattr(proc, "captured_metrics", []))
 
+        # New capture → send to backend
         if cap_img is not None and cap_ts > st.session_state["last_ts"]:
-            # 更新本地时间戳
             st.session_state["last_ts"] = cap_ts
             st.session_state["last_metrics"] = cap_metrics
 
-            # 把抓拍图发给后端 /match
             buf = io.BytesIO()
             cap_img.save(buf, format="JPEG")
             buf.seek(0)
 
             files = {"image": ("frame.jpg", buf.getvalue(), "image/jpeg")}
-            data = {"museum": "local", "topk": 3}
+            # Global mixed index, only Top-1
+            data = {"museum": "mixed", "topk": 1}
 
             try:
                 resp = requests.post(API_URL, files=files, data=data, timeout=30)
@@ -577,61 +577,47 @@ with right:
         elif "error" in payload:
             ph.error(f"Error from backend: {payload['error']}")
         else:
-                    payload = st.session_state.get("last_match")
-
-        if not payload:
-            ph.info("Hold still or press capture to trigger matching…")
-        elif "error" in payload:
-            ph.error(f"Error from backend: {payload['error']}")
-        else:
             results = payload.get("results") or []
             if not results:
                 ph.warning("No matches returned from backend.")
             else:
-                # --- NEW: loop over all Top-K results instead of only results[0] ---
                 metrics = st.session_state.get("last_metrics") or []
+                top = results[0]
 
-                # 用一个容器承载多张图，纵向排布
-                with ph.container():
-                    for i, item in enumerate(results, start=1):
-                        filename = item.get("filename") or item.get("file")
-                        if not filename:
-                            continue
-
-                        img_path = ensure_image_path(filename)
-                        if not img_path:
-                            st.error(f"[{i}] Image file not found for: {filename}")
-                            continue
-
+                filename = top.get("filename") or top.get("file")
+                if not filename:
+                    ph.error("Backend did not return a filename.")
+                else:
+                    img_path = ensure_image_path(filename)
+                    if not img_path:
+                        ph.error(f"Image file not found for: {filename}")
+                    else:
                         painting = safe_open_image(img_path)
                         if painting is None:
-                            st.error(f"[{i}] Failed to open image: {img_path}")
-                            continue
+                            ph.error(f"Failed to open image: {img_path}")
+                        else:
+                            meta_row = lookup_meta(str(filename))
+                            meta = {
+                                "artist": meta_row.get("artist")
+                                or top.get("artist")
+                                or "artist name",
+                                "year": meta_row.get("year")
+                                or top.get("year")
+                                or "",
+                                "price_text": meta_row.get("price_text")
+                                or meta_row.get("auction_price_usd")
+                                or "",
+                            }
 
-                        # 从本地 CSV 查补充 meta
-                        meta_row = lookup_meta(str(filename))
-                        meta = {
-                            "artist": meta_row.get("artist")
-                            or item.get("artist")
-                            or "artist name",
-                            "year": meta_row.get("year")
-                            or item.get("year")
-                            or "",
-                            "price_text": meta_row.get("price_text")
-                            or meta_row.get("auction_price_usd")
-                            or "",
-                        }
+                            painted = overlay_right_labels(painting, meta)
+                            painted = draw_tiny_metrics_top_right(
+                                painted, metrics, size=16, margin=12
+                            )
 
-                        painted = overlay_right_labels(painting, meta)
-                        painted = draw_tiny_metrics_top_right(
-                            painted, metrics, size=16, margin=12
-                        )
-
-                        w = min(RIGHT_IMG_MAXW, painted.width)
-                        title = meta_row.get("title", "") or item.get("title", "")
-                        caption = f"#{i} {title} — {meta.get('artist','')}"
-                        st.image(painted, caption=caption, width=w)
-                        st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+                            w = min(RIGHT_IMG_MAXW, painted.width)
+                            title = meta_row.get("title", "") or top.get("title", "")
+                            caption = f"{title} — {meta.get('artist','')}"
+                            ph.image(painted, caption=caption, width=w)
 
     st.markdown("</div>", unsafe_allow_html=True)  # /art-wrap
     st.markdown("</div>", unsafe_allow_html=True)  # /right-col
