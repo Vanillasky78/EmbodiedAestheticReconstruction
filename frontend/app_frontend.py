@@ -20,36 +20,38 @@ from streamlit_webrtc import (
     webrtc_streamer,
 )
 
-# =================== PATHS & CONSTANTS ===================
+# Try import YOLO (pose)
+try:
+    from ultralytics import YOLO
+
+    HAS_YOLO = True
+except Exception:
+    HAS_YOLO = False
+
+# =================== paths & constants ===================
 
 FRONTEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = FRONTEND_DIR.parent
 
-# Use global mixed data (local + met)
+# Global mixed data (local + met)
 DATA_DIR = ROOT_DIR / "data" / "mixed"
 IMAGES_DIR = DATA_DIR / "images"
 
-# Meta CSVs: prefer mixed embeddings_meta, then fall back to local CSVs
 META_CSV_CANDIDATES = [
     DATA_DIR / "embeddings_meta.csv",
     ROOT_DIR / "data" / "local" / "portrait_works_enhanced_english.csv",
     ROOT_DIR / "data" / "local" / "portrait_works.csv",
 ]
 
-# Backend API
 DEFAULT_API_URL = "http://127.0.0.1:8000/match"
-
 APP_TITLE = "Embodied Aesthetic Reconstruction"
 
-# YOLOv8-Pose model path (placed in frontend/)
 YOLO_MODEL_PATH = FRONTEND_DIR / "yolov8n-pose.pt"
 
-# WebRTC config (Safari needs STUN)
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
-# Stillness detection
 STILLNESS_SEC = 3.5
 MAX_BUF_SEC = 5.0
 FPS_ASSUMED = 12
@@ -57,22 +59,19 @@ MOTION_EPS_CXCY = 4.0
 MOTION_EPS_AREA = 0.03
 MIN_FACE_AREA = 0.06
 
-# Colors
 YELLOW = (255, 235, 59)
 BLACK = (0, 0, 0)
 HOT_PINK = (255, 30, 180)
 
-# Right image max display width
 RIGHT_IMG_MAXW = 900
 
-
-# =================== META & IMAGE HELPERS ===================
+# =================== utils ===================
 
 _META_CACHE: Optional[Dict[str, Dict]] = None
 
 
 def load_meta_mapping() -> Dict[str, Dict]:
-    """Load CSV metadata and index by filename."""
+    """Load local CSV and index by filename."""
     global _META_CACHE
     if _META_CACHE is not None:
         return _META_CACHE
@@ -114,7 +113,6 @@ def safe_open_image(p: Path) -> Optional[Image.Image]:
 
 
 def ensure_image_path(filename: str) -> Optional[Path]:
-    """Resolve filename inside IMAGES_DIR."""
     if not filename:
         return None
     p = Path(filename)
@@ -123,11 +121,8 @@ def ensure_image_path(filename: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
-# =================== DRAWING HELPERS ===================
-
-
 def _load_font(size: int = 40) -> ImageFont.FreeTypeFont:
-    """Prefer Courier / Courier New, fall back to Arial / default."""
+    """Prefer Courier / Courier New, fallback to Arial / default."""
     candidates = [
         "/Library/Fonts/Courier New.ttf",
         "/System/Library/Fonts/Courier.dfont",
@@ -147,7 +142,7 @@ def _load_font(size: int = 40) -> ImageFont.FreeTypeFont:
 def draw_tiny_metrics_top_right(
     im: Image.Image, lines: List[str], size: int = 16, margin: int = 10
 ) -> Image.Image:
-    """Draw tiny pink pose metrics in the top-right corner."""
+    """Pink tiny text: pose metrics at top-right."""
     if not lines:
         return im
     img = im.copy()
@@ -169,115 +164,109 @@ def draw_tiny_metrics_top_right(
     return img
 
 
-def _angle_deg(p1, p2):
-    if p1 is None or p2 is None:
-        return None
-    vx, vy = p2[0] - p1[0], p2[1] - p1[1]
-    return float(np.degrees(np.arctan2(vy, vx)))
+def overlay_right_labels(im: Image.Image, meta: Dict) -> Image.Image:
+    """
+    Draw yellow price bar etc. on the matched artwork (Courier font).
+    """
+    img = im.copy()
+    d = ImageDraw.Draw(img)
+    font = _load_font(size=max(24, img.width // 20))
 
+    price_text = meta.get("price_text") or ""
+    year = str(meta.get("year") or "").strip()
+    if not price_text and not year:
+        return img
 
-def _elbow_angle(shoulder, elbow, wrist):
-    if None in (shoulder, elbow, wrist):
-        return None
-    v1 = np.array([shoulder[0] - elbow[0], shoulder[1] - elbow[1]], float)
-    v2 = np.array([wrist[0] - elbow[0], wrist[1] - elbow[1]], float)
-    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-    if n1 < 1e-5 or n2 < 1e-5:
-        return None
-    cosv = np.clip(np.dot(v1, n2 and v2) / (n1 * n2), -1.0, 1.0)
-    return float(np.degrees(np.arccos(cosv)))
+    padding_x = img.width * 0.03
+    padding_y = img.height * 0.02
+    bar_h = img.height * 0.10
+
+    x0 = padding_x
+    y0 = img.height - bar_h - padding_y
+    x1 = img.width - padding_x
+    y1 = img.height - padding_y
+
+    d.rectangle([x0, y0, x1, y1], fill=YELLOW)
+
+    text_lines: List[str] = []
+    if price_text:
+        text_lines.append(str(price_text))
+    if year:
+        text_lines.append(str(year))
+
+    tx = x0 + padding_x
+    ty = y0 + padding_y * 0.3
+    for line in text_lines:
+        d.text((tx, ty), line, fill=BLACK, font=font)
+        _, _, _, b = d.textbbox((0, 0), line, font=font)
+        ty += b * 1.1
+
+    return img
 
 
 def format_metrics(kps: Dict[int, Tuple[float, float] | None]) -> List[str]:
-    """Convert keypoints into several formatted lines."""
-    le, re = kps.get(1), kps.get(2)
-    lsh, rsh = kps.get(5), kps.get(6)
-    lel, rel = kps.get(7), kps.get(8)
-    lwr, rwr = kps.get(9), kps.get(10)
-
-    fdeg = lambda v: "—" if v is None else f"{v:+.1f}°"
-    fpt = lambda p: "(0, 0)" if p is None else f"({int(p[0])}, {int(p[1])})"
-
-    return [
-        f"Head tilt: {fdeg(_angle_deg(re, le))}",
-        f"Shoulder:  {fdeg(_angle_deg(rsh, lsh))}",
-        f"L elbow:   {fdeg(_elbow_angle(lsh, lel, lwr))}",
-        f"R elbow:   {fdeg(_elbow_angle(rsh, rel, rwr))}",
-        f"L wrist:   {fpt(lwr)}",
-        f"R wrist:   {fpt(rwr)}",
-    ]
-
-
-def overlay_right_labels(painting: Image.Image, meta: Dict) -> Image.Image:
     """
-    Overlay 3 yellow rectangular labels on the artwork:
-      1. price (price_text / auction_price_usd)
-      2. year
-      3. artist
-    Font: Courier, black text on yellow background.
+    Build several pose-related text metrics for overlay & logging.
+    Very lightweight heuristics, not scientific.
     """
-    im = painting.convert("RGB").copy()
-    draw = ImageDraw.Draw(im)
+    def _angle(a, b, c) -> Optional[float]:
+        if a is None or b is None or c is None:
+            return None
+        ax, ay = a
+        bx, by = b
+        cx, cy = c
+        v1 = np.array([ax - bx, ay - by], dtype=float)
+        v2 = np.array([cx - bx, cy - by], dtype=float)
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 < 1e-6 or n2 < 1e-6:
+            return None
+        cos = float(np.dot(v1, v2) / (n1 * n2))
+        cos = max(-1.0, min(1.0, cos))
+        return float(np.degrees(np.arccos(cos)))
 
-    font_big = _load_font(44)
-    font_small = _load_font(36)
+    nose = kps.get(0)
+    l_shoulder = kps.get(5)
+    r_shoulder = kps.get(6)
+    l_elbow = kps.get(7)
+    r_elbow = kps.get(8)
+    l_wrist = kps.get(9)
+    r_wrist = kps.get(10)
 
-    price = (
-        meta.get("price_text")
-        or meta.get("auction_price_usd")
-        or meta.get("price")
-        or "—"
-    )
-    year = str(meta.get("year") or "—")
-    artist = meta.get("artist") or "artist name"
+    lines: List[str] = []
 
-    lines = [price, year, artist]
-    fonts = [font_big, font_small, font_big]
+    # Head tilt (approx)
+    if nose and l_shoulder and r_shoulder:
+        sx = 0.5 * (l_shoulder[0] + r_shoulder[0])
+        sy = 0.5 * (l_shoulder[1] + r_shoulder[1])
+        dx = nose[0] - sx
+        dy = nose[1] - sy
+        if dx != 0 or dy != 0:
+            tilt = np.degrees(np.arctan2(dy, dx))
+            lines.append(f"Head tilt: {tilt:+.1f}°")
 
-    margin_x = 24
-    y = int(im.height * 0.50)
+    # Shoulder angle
+    if l_shoulder and r_shoulder:
+        dx = r_shoulder[0] - l_shoulder[0]
+        dy = r_shoulder[1] - l_shoulder[1]
+        if dx != 0 or dy != 0:
+            ang = np.degrees(np.arctan2(dy, dx))
+            lines.append(f"Shoulder: {ang:+.1f}°")
 
-    for text, font in zip(lines, fonts):
-        l, t, r, b = draw.textbbox((0, 0), text, font=font)
-        w, h = r - l, b - t
+    # Elbow angles
+    ang_l = _angle(l_shoulder, l_elbow, l_wrist) if (l_shoulder and l_elbow and l_wrist) else None
+    ang_r = _angle(r_shoulder, r_elbow, r_wrist) if (r_shoulder and r_elbow and r_wrist) else None
+    if ang_l is not None:
+        lines.append(f"L elbow: {ang_l:.0f}°")
+    if ang_r is not None:
+        lines.append(f"R elbow: {ang_r:.0f}°")
 
-        pad_x, pad_y = 16, 10
-        box_w, box_h = w + 2 * pad_x, h + 2 * pad_y
-
-        x = margin_x
-        draw.rectangle([x, y, x + box_w, y + box_h], fill=YELLOW)
-        draw.text((x + pad_x, y + pad_y), text, fill=BLACK, font=font)
-
-        y += box_h + 10
-
-    return im
-
-
-def force_rerun():
-    try:
-        st.rerun()
-    except Exception:
-        try:
-            st.experimental_rerun()
-        except Exception:
-            pass
+    return lines
 
 
-# =================== YOLO VIDEO PROCESSOR ===================
-
-try:
-    from ultralytics import YOLO
-
-    HAS_YOLO = True
-except Exception:
-    HAS_YOLO = False
-
+# =================== WebRTC video processor ===================
 
 class CuratorialProcessor(VideoProcessorBase):
-    """
-    YOLOv8-Pose overlay + stillness detection + capture.
-    """
-
     def __init__(self):
         self.model = None
         if HAS_YOLO:
@@ -367,7 +356,7 @@ class CuratorialProcessor(VideoProcessorBase):
             return False
 
     def _stamp_capture(self):
-        """Save current frame and metrics as a capture."""
+        """Store current frame & metrics as a capture."""
         self.captured_img = Image.fromarray(self.latest_rgb)
         self.captured_ts = time.time()
         self.captured_metrics = list(self.last_metrics_lines)
@@ -390,7 +379,7 @@ class CuratorialProcessor(VideoProcessorBase):
 
         if self.model:
             res = self.model.predict(img_rgb, imgsz=640, device="cpu", verbose=False)
-            plotted = res[0].plot()[:, :, ::-1]
+            plotted = res[0].plot()[:, :, ::-1]  # YOLO provided blue box + green skeleton
             kps = self._extract_keypoints(res)
             lines = format_metrics(kps)
             with self.lock:
@@ -404,114 +393,109 @@ class CuratorialProcessor(VideoProcessorBase):
             out_rgb = img_rgb
 
         bbox = self._detect_bbox(img_rgb) if self.model else None
-        if bbox and self._update_stillness(bbox, w, h):
-            with self.lock:
-                if time.time() - self.captured_ts > 0.35:
+        if bbox is not None:
+            stable = self._update_stillness(bbox, w, h)
+            if stable:
+                with self.lock:
                     self._stamp_capture()
 
-        out_bgr = out_rgb[:, :, ::-1]
-        return av.VideoFrame.from_ndarray(out_bgr, format="bgr24")
+        return av.VideoFrame.from_ndarray(out_rgb, format="rgb24")
 
 
-# =================== STREAMLIT LAYOUT ===================
+# =================== Streamlit app ===================
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 st.markdown(
-    f"""
-<style>
-section[data-testid="stSidebar"] {{ display: none !important; }}
-header, footer, [data-testid="stToolbar"] {{ visibility: hidden !important; }}
-.block-container {{ padding-top: 0.6rem; padding-bottom: 0.6rem; max-width: 1700px; }}
-
-.left-col .cam-wrap {{
-  position: relative;
-  height: 92vh;
-  width: 100%;
-  overflow: hidden;
-  border-radius: 12px;
-  background: #111;
-}}
-.left-col .cam-wrap video {{
-  height: 100% !important;
-  width: auto !important;
-  object-fit: cover !important;
-  border-radius: 12px !important;
-}}
-
-.right-col .art-wrap {{
-  position: relative;
-  height: 92vh;
-  max-width: {RIGHT_IMG_MAXW}px;
-  overflow: hidden;
-  margin: 0 auto;
-}}
-.right-col .art-wrap img {{
-  display: block;
-  width: 100% !important;
-  height: 100% !important;
-  object-fit: cover !important;
-}}
-</style>
-""",
+    """
+    <style>
+      .stApp [data-testid=stSidebar] {display: none;}
+      .block-container {
+        padding-top: 1.2rem;
+        padding-bottom: 0.5rem;
+        max-width: 1600px;
+      }
+      .left-col, .right-col {
+        height: calc(100vh - 140px);
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-start;
+      }
+      .left-col video, .left-col canvas {
+        width: 100% !important;
+        height: 100% !important;
+        object-fit: cover !important;
+      }
+      .right-col img {
+        width: 100% !important;
+        height: 100% !important;
+        object-fit: cover !important;
+      }
+      .art-wrap {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+      }
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 
-st.title(APP_TITLE)
-st.caption(
+st.markdown(
+    f"<h1 style='font-family:system-ui;margin-bottom:0.2rem;'>{APP_TITLE}</h1>",
+    unsafe_allow_html=True,
+)
+st.markdown(
+    "<p style='opacity:0.75;margin-bottom:1.2rem;'>"
     "Hold still for ~3–5 seconds to auto-capture, or press the button to capture on demand. "
-    "Left: live with pose. Right: single matched artwork with tiny pink metrics."
+    "Left: live video with pose. Right: single matched artwork with tiny pink metrics."
+    "</p>",
+    unsafe_allow_html=True,
 )
 
-# Slight auto-refresh so right side updates after capture
-try:
-    st.autorefresh(interval=700, key="ear_auto", limit=None)
-except Exception:
-    pass
+API_URL = DEFAULT_API_URL
 
-left, right = st.columns([1, 1], gap="large")
-
-if "countdown_target" not in st.session_state:
-    st.session_state["countdown_target"] = None
+if "last_ts" not in st.session_state:
+    st.session_state["last_ts"] = 0.0
 if "last_match" not in st.session_state:
     st.session_state["last_match"] = None
 if "last_metrics" not in st.session_state:
     st.session_state["last_metrics"] = []
-if "last_ts" not in st.session_state:
-    st.session_state["last_ts"] = 0.0
+if "countdown_target" not in st.session_state:
+    st.session_state["countdown_target"] = None
 
-API_URL = DEFAULT_API_URL
 
-# ------------------- LEFT: LIVE CAMERA -------------------
+def force_rerun():
+    st.experimental_rerun()
+
+
+left, right = st.columns(2, gap="large")
 
 with left:
     st.subheader("Live")
     st.markdown('<div class="left-col">', unsafe_allow_html=True)
-    st.markdown('<div class="cam-wrap">', unsafe_allow_html=True)
 
     ctx = webrtc_streamer(
-        key="ear-curatorial-final",
-        mode=WebRtcMode.SENDRECV,
+        key="ear-webrtc",
+        mode=WebRtcMode.LIVE,
         rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": True, "audio": False},
         video_processor_factory=CuratorialProcessor,
+        media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
     )
 
-    st.markdown("</div>", unsafe_allow_html=True)  # /cam-wrap
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-
-    c1, c2 = st.columns(2)
-    with c1:
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
         if st.button("📸 Capture (wait 3s)", use_container_width=True):
             st.session_state["countdown_target"] = time.time() + 3.0
-    with c2:
+    with col_btn2:
         if st.button("⚡ Instant Capture", use_container_width=True):
             if ctx and ctx.video_processor:
                 ok = ctx.video_processor.capture_now()
-                st.toast("Captured." if ok else "No frame yet, try again.", icon="✅" if ok else "⚠️")
+                st.toast("Captured." if ok else "No frame yet.", icon="✅" if ok else "⚠️")
+                if ok:
+                    force_rerun()
 
-    # Countdown logic
     if st.session_state["countdown_target"]:
         remain = st.session_state["countdown_target"] - time.time()
         if remain > 0:
@@ -525,15 +509,12 @@ with left:
 
     st.markdown("</div>", unsafe_allow_html=True)  # /left-col
 
-# ------------------- RIGHT: MATCHED ARTWORK (TOP-1) -------------------
-
 with right:
     st.subheader("Matched artwork")
     st.markdown('<div class="right-col">', unsafe_allow_html=True)
     st.markdown('<div class="art-wrap">', unsafe_allow_html=True)
 
     ph = st.empty()
-
     proc: Optional[CuratorialProcessor] = None
     if ctx and ctx.video_processor:
         proc = ctx.video_processor
@@ -541,13 +522,11 @@ with right:
     if not proc:
         ph.info("Initializing camera…")
     else:
-        # Read latest capture from processor
         with proc.lock:
             cap_img = proc.captured_img
             cap_ts = getattr(proc, "captured_ts", 0.0)
             cap_metrics = list(getattr(proc, "captured_metrics", []))
 
-        # New capture → send to backend
         if cap_img is not None and cap_ts > st.session_state["last_ts"]:
             st.session_state["last_ts"] = cap_ts
             st.session_state["last_metrics"] = cap_metrics
@@ -557,8 +536,7 @@ with right:
             buf.seek(0)
 
             files = {"image": ("frame.jpg", buf.getvalue(), "image/jpeg")}
-            # Global mixed index, only Top-1
-            data = {"museum": "mixed", "topk": 1}
+            data = {"museum": "mixed", "topk": 3}
 
             try:
                 resp = requests.post(API_URL, files=files, data=data, timeout=30)
@@ -581,43 +559,34 @@ with right:
             if not results:
                 ph.warning("No matches returned from backend.")
             else:
-                metrics = st.session_state.get("last_metrics") or []
+                # Top-1 only for clean exhibition effect
                 top = results[0]
-
                 filename = top.get("filename") or top.get("file")
-                if not filename:
-                    ph.error("Backend did not return a filename.")
+
+                img_path = ensure_image_path(filename or "")
+                if not img_path:
+                    ph.error(f"Image file not found for: {filename}")
                 else:
-                    img_path = ensure_image_path(filename)
-                    if not img_path:
-                        ph.error(f"Image file not found for: {filename}")
+                    painting = safe_open_image(img_path)
+                    if painting is None:
+                        ph.error(f"Failed to open image: {img_path}")
                     else:
-                        painting = safe_open_image(img_path)
-                        if painting is None:
-                            ph.error(f"Failed to open image: {img_path}")
-                        else:
-                            meta_row = lookup_meta(str(filename))
-                            meta = {
-                                "artist": meta_row.get("artist")
-                                or top.get("artist")
-                                or "artist name",
-                                "year": meta_row.get("year")
-                                or top.get("year")
-                                or "",
-                                "price_text": meta_row.get("price_text")
-                                or meta_row.get("auction_price_usd")
-                                or "",
-                            }
+                        meta_row = lookup_meta(str(filename))
+                        meta = {
+                            "artist": meta_row.get("artist") or top.get("artist") or "artist name",
+                            "year": meta_row.get("year") or top.get("year") or "",
+                            "price_text": meta_row.get("price_text")
+                            or meta_row.get("auction_price_usd")
+                            or "",
+                        }
 
-                            painted = overlay_right_labels(painting, meta)
-                            painted = draw_tiny_metrics_top_right(
-                                painted, metrics, size=16, margin=12
-                            )
+                        painted = overlay_right_labels(painting, meta)
+                        metrics = st.session_state.get("last_metrics") or []
+                        painted = draw_tiny_metrics_top_right(painted, metrics, size=16, margin=12)
 
-                            w = min(RIGHT_IMG_MAXW, painted.width)
-                            title = meta_row.get("title", "") or top.get("title", "")
-                            caption = f"{title} — {meta.get('artist','')}"
-                            ph.image(painted, caption=caption, width=w)
+                        w = min(RIGHT_IMG_MAXW, painted.width)
+                        caption = f"{meta_row.get('title','')} — {meta.get('artist','')}"
+                        ph.image(painted, caption=caption, width=w)
 
     st.markdown("</div>", unsafe_allow_html=True)  # /art-wrap
     st.markdown("</div>", unsafe_allow_html=True)  # /right-col

@@ -7,6 +7,8 @@ Exposes:
 
 It uses the PoseMatcher defined in backend/model/pose_matcher.py and the
 Settings from backend/config.py.
+
+Default index: data/mixed/ (global mixed index: local + met).
 """
 
 from __future__ import annotations
@@ -32,14 +34,13 @@ logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(
     title="Embodied Aesthetic Reconstruction — Backend API",
-    version="0.1.0",
-    description="CLIP-based portrait → artwork matching backend.",
+    version="0.2.0",
+    description="CLIP + pose based portrait → artwork matching backend.",
 )
 
-# Allow everything locally; you can tighten this later if needed.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # you can tighten this later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -87,6 +88,7 @@ def health():
         "default_museum": getattr(settings, "default_museum", None)
         if settings
         else None,
+        "pose_weight": getattr(settings, "pose_weight", None) if settings else None,
     }
 
 
@@ -117,7 +119,7 @@ class MatchResponse(BaseModel):
 @app.post("/match", response_model=MatchResponse)
 async def match(
     image: UploadFile = File(..., description="Uploaded portrait photo"),
-    museum: Optional[str] = Form(None, description="Museum name, e.g. local / met"),
+    museum: Optional[str] = Form(None, description="Museum name (kept for compatibility)"),
     topk: int = Form(3, description="Number of top results"),
 ):
     """
@@ -128,7 +130,6 @@ async def match(
     - calls PoseMatcher.match_pil(...)
     - tries to back-fill missing title / artist / year from matcher.meta_by_filename
     """
-    # ----------------- basic validation -----------------
     if topk <= 0:
         topk = 3
 
@@ -145,7 +146,6 @@ async def match(
             detail="Empty file received. Please take a photo again.",
         )
 
-    # ----------------- decode to PIL -----------------
     try:
         pil_img = Image.open(io.BytesIO(data)).convert("RGB")
     except Exception as exc:
@@ -155,7 +155,6 @@ async def match(
             detail=f"Invalid image file: {type(exc).__name__}",
         )
 
-    # ----------------- check matcher -----------------
     global matcher
     if matcher is None:
         raise HTTPException(
@@ -163,9 +162,8 @@ async def match(
             detail="Matcher is not loaded on the server.",
         )
 
-    effective_museum = museum or getattr(matcher, "default_museum", None) or "local"
+    effective_museum = museum or getattr(matcher, "default_museum", None) or "mixed"
 
-    # ----------------- run matcher -----------------
     try:
         if hasattr(matcher, "match_pil"):
             raw_results = matcher.match_pil(
@@ -188,7 +186,6 @@ async def match(
             detail=f"Internal error during matching: {type(exc).__name__}: {exc}",
         )
 
-    # ----------------- normalize results structure -----------------
     payload: List[MatchResult] = []
 
     meta_store = getattr(matcher, "meta_by_filename", None)
@@ -227,7 +224,6 @@ async def match(
         title, artist, year = fill_from_meta(filename, title, artist, year)
 
         # normalise year → int or None
-        year_int: Optional[int]
         try:
             if isinstance(year, str) and year.strip():
                 year_int = int(year.split(",")[0].strip())
@@ -244,12 +240,8 @@ async def match(
                 title=title,
                 artist=artist,
                 year=year_int,
-                score=float(score),
+                score=score,
             )
         )
 
-    return MatchResponse(
-        museum=effective_museum,
-        topk=topk,
-        results=payload,
-    )
+    return MatchResponse(museum=effective_museum, topk=topk, results=payload)
