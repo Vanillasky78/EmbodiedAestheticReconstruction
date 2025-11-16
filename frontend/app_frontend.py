@@ -476,13 +476,13 @@ with left:
     st.markdown('<div class="left-col">', unsafe_allow_html=True)
 
     ctx = webrtc_streamer(
-        key="ear-webrtc",
-        mode=WebRtcMode.LIVE,
-        rtc_configuration=RTC_CONFIGURATION,
-        video_processor_factory=CuratorialProcessor,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-    )
+    key="ear-webrtc",
+    mode=WebRtcMode.SENDRECV, 
+    rtc_configuration=RTC_CONFIGURATION,
+    video_processor_factory=CuratorialProcessor,
+    media_stream_constraints={"video": True, "audio": False},
+    async_processing=True,
+)
 
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
