@@ -1,144 +1,200 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Build pose embeddings for a museum folder.
+build_pose_embeddings.py
+-------------------------
+Generate pose-based embeddings for all artworks using YOLOv8-Pose.
 
-For now this uses the same CLIP encoder as build_embeddings.py,
-so everything works out-of-the-box. Later you can replace it with a
-true pose encoder (e.g. from YOLO keypoints).
+Output:
+    data/mixed/pose_embeddings.npy
+    (same row ordering as embeddings_meta.csv)
 
-Layout (per museum):
-  data/<museum>/
-    images/
-    pose_embeddings.npy      # (N, D_pose)  (same N as embeddings.npy)
-
-Usage example:
-  python backend/tools/build_pose_embeddings.py --museum mixed --data_root data
-
-Deps:
-  pip install open_clip_torch torch pillow numpy tqdm
+Usage:
+    conda activate ear-mvp
+    python backend/tools/build_pose_embeddings.py --data-root data/mixed
 """
+
+from __future__ import annotations
 
 import argparse
-import os
-from typing import List, Optional
-
+from pathlib import Path
 import numpy as np
 from PIL import Image
+import json
 from tqdm import tqdm
 
-import torch
-import open_clip
+# YOLOv8-Pose
+try:
+    from ultralytics import YOLO
+except Exception as exc:
+    raise RuntimeError("Ultralytics YOLO is required. `pip install ultralytics`.") from exc
 
 
-def detect_device(device_override: Optional[str] = None) -> torch.device:
-    if device_override:
-        return torch.device(device_override)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+# -------------------------
+# Pose vector utilities
+# -------------------------
+
+def encode_pose_keypoints(kps: np.ndarray | None, img_w: int, img_h: int) -> np.ndarray:
+    """
+    Convert raw keypoints (N x 3: x,y,confidence) into a fixed pose vector.
+
+    We encode:
+      - normalized coordinates (x/img_w, y/img_h)
+      - per-joint existence mask
+      - joint angle features
+    """
+
+    num_joints = 17  # YOLOv8 Pose has 17 keypoints (0..16)
+    if kps is None:
+        # No detection → zero vector
+        return np.zeros(num_joints * 4, dtype=np.float32)
+
+    # If YOLO returns more than one person, we take the one with largest area
+    # but build_embeddings will only run on artwork images (static), so 1 person is expected.
+    if len(kps.shape) == 3:  # shape [num_people, 17, 3]
+        kps = kps[0]
+
+    # Prepare vector components
+    coord_vec = np.zeros((num_joints, 2), dtype=np.float32)
+    mask_vec  = np.zeros((num_joints, 1), dtype=np.float32)
+    angle_vec = np.zeros((num_joints, 1), dtype=np.float32)
+
+    # Normalize
+    for i in range(num_joints):
+        x, y, conf = kps[i]
+        if conf > 0.1:
+            coord_vec[i] = np.array([x / img_w, y / img_h])
+            mask_vec[i] = 1.0
+        else:
+            coord_vec[i] = 0.0
+            mask_vec[i] = 0.0
+
+    # Compute simple limb angles (example: shoulders/elbows/wrists)
+    # We encode angle at elbow and knee joints for stability
+    def safe_angle(a, b, c):
+        """Return angle ABC in radians."""
+        if (a is None) or (b is None) or (c is None):
+            return 0.0
+        ax, ay = a
+        bx, by = b
+        cx, cy = c
+        v1 = np.array([ax - bx, ay - by])
+        v2 = np.array([cx - bx, cy - by])
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 < 1e-6 or n2 < 1e-6:
+            return 0.0
+        cosv = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+        return float(np.arccos(cosv))  # radians
+
+    # Joint indices follow COCO:
+    # 5: left shoulder, 6: right shoulder
+    # 7: left elbow,    8: right elbow
+    # 9: left wrist,   10: right wrist
+    # 11: left hip,    12: right hip
+    # 13: left knee,   14: right knee
+    # 15: left ankle,  16: right ankle
+
+    joints = kps[:, :2]
+    def jp(idx):
+        x, y, conf = kps[idx]
+        return (x, y) if conf > 0.1 else None
+
+    # elbow angles
+    angle_vec[7]  = safe_angle(jp(5), jp(7), jp(9))
+    angle_vec[8]  = safe_angle(jp(6), jp(8), jp(10))
+
+    # knee angles
+    angle_vec[13] = safe_angle(jp(11), jp(13), jp(15))
+    angle_vec[14] = safe_angle(jp(12), jp(14), jp(16))
+
+    # Flatten
+    return np.concatenate([
+        coord_vec.reshape(-1),
+        mask_vec.reshape(-1),
+        angle_vec.reshape(-1),
+    ]).astype(np.float32)
 
 
-def list_images(folder: str) -> List[str]:
-    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
-    files = []
-    for name in sorted(os.listdir(folder)):
-        p = os.path.join(folder, name)
-        if os.path.isfile(p) and os.path.splitext(name.lower())[1] in exts:
-            files.append(p)
-    return files
+# -------------------------
+# Main build function
+# -------------------------
 
+def build_pose_embeddings(data_root: Path, model_path: Path):
+    meta_path = data_root / "embeddings_meta.csv"
+    images_dir = data_root / "images"
 
-def normalize_rows(x: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
-    return x / n
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Missing: {meta_path}")
 
+    # Load metadata rows in order
+    import csv
+    with open(meta_path, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
 
-def build_pose_for_museum(
-    museum: str,
-    data_root: str = "data",
-    model_name: str = "ViT-B-32",
-    pretrained: str = "openai",
-    device: Optional[str] = None,
-    overwrite: bool = False,
-):
-    base = os.path.join(data_root, museum)
-    img_dir = os.path.join(base, "images")
-    pose_path = os.path.join(base, "pose_embeddings.npy")
+    print(f"[INFO] Loaded {len(rows)} metadata rows.")
 
-    if not os.path.isdir(img_dir):
-        print(f"[WARN] images folder not found: {img_dir}")
-        return
+    # Init YOLO pose model
+    print(f"[INFO] Loading YOLOv8-Pose: {model_path}")
+    model = YOLO(str(model_path))
 
-    if os.path.exists(pose_path) and not overwrite:
-        print(f"[SKIP] {museum}: pose_embeddings already exists ({pose_path})")
-        return
+    pose_vectors = []
 
-    files = list_images(img_dir)
-    if not files:
-        print(f"[WARN] no images in {img_dir}")
-        return
-
-    dev = detect_device(device)
-    print(f"[INFO] building pose embeddings for {museum} on {dev}…")
-
-    model, preprocess, _ = open_clip.create_model_and_transforms(
-        model_name,
-        pretrained=pretrained,
-        device=dev,
-    )
-    model.eval()
-
-    feats = []
-    for path in tqdm(files, desc=f"{museum}"):
-        try:
-            pil = Image.open(path).convert("RGB")
-        except Exception as e:
-            print(f"[WARN] failed to open {path}: {e}")
+    for row in tqdm(rows, desc="Building pose vectors"):
+        fname = (
+            row.get("filename")
+            or row.get("image_path")
+            or row.get("path")
+            or row.get("file")
+        )
+        if not fname:
+            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
             continue
 
-        im = preprocess(pil).unsqueeze(0).to(dev)
-        with torch.no_grad(), torch.autocast(device_type=str(dev), enabled=(dev.type in ["cuda", "mps"])):
-            feat = model.encode_image(im)
-            feat = feat.float().cpu().numpy()
-        feats.append(feat)
+        img_path = images_dir / fname
+        if not img_path.exists():
+            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
+            continue
 
-    if not feats:
-        print(f"[WARN] no features produced for: {museum}")
-        return
+        try:
+            img = Image.open(img_path).convert("RGB")
+        except Exception:
+            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
+            continue
 
-    E = np.concatenate(feats, axis=0)  # (N, D)
-    E = normalize_rows(E)
-    np.save(pose_path, E)
-    print(f"[OK] {museum}: pose_embeddings={E.shape} → {pose_path}")
+        w, h = img.size
+        img_np = np.array(img)
+
+        # YOLO pose inference
+        res = model.predict(img_np, imgsz=640, device="cpu", verbose=False)
+        if len(res) == 0 or res[0].keypoints is None:
+            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
+            continue
+
+        kps = res[0].keypoints.cpu().numpy()  # shape: [1, 17, 3]
+        vec = encode_pose_keypoints(kps, w, h)
+        pose_vectors.append(vec)
+
+    pose_vectors = np.stack(pose_vectors, axis=0)
+    out_path = data_root / "pose_embeddings.npy"
+
+    np.save(out_path, pose_vectors)
+    print(f"[OK] Saved pose embeddings → {out_path}")
+    print(f"[INFO] shape = {pose_vectors.shape} (rows match embeddings_meta.csv)")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--museum", type=str, help="Museum folder name under data/, e.g. local / met / mixed")
-    parser.add_argument("--data_root", type=str, default="data")
-    parser.add_argument("--model", type=str, default="ViT-B-32")
-    parser.add_argument("--pretrained", type=str, default="openai")
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--overwrite", action="store_true")
-    args = parser.parse_args()
-
-    if not args.museum:
-        print("\nPlease set --museum=NAME (e.g. --museum=mixed).\n")
-        raise SystemExit(1)
-
-    build_pose_for_museum(
-        museum=args.museum,
-        data_root=args.data_root,
-        model_name=args.model,
-        pretrained=args.pretrained,
-        device=args.device,
-        overwrite=args.overwrite,
-    )
-
+# -------------------------
+# CLI
+# -------------------------
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", type=str, default="data/mixed",
+                        help="path to dataset folder that contains images/ and embeddings_meta.csv")
+    parser.add_argument("--yolo-model", type=str, default="frontend/yolov8n-pose.pt",
+                        help="path to YOLOv8-Pose .pt file")
+
+    args = parser.parse_args()
+
+    build_pose_embeddings(
+        Path(args.data_root),
+        Path(args.yolo_model),
+    )
