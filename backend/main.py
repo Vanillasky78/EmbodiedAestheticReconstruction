@@ -1,247 +1,133 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-EAR Backend API (FastAPI + Uvicorn)
-
-Exposes:
-- GET  /health     → quick status check
-- POST /match      → upload an image and get Top-K matched artworks
-
-It uses the PoseMatcher defined in backend/model/pose_matcher.py and the
-Settings from backend/config.py.
-
-Default index: data/mixed/ (global mixed index: local + met).
+Backend API for Hybrid CLIP + Pose Matching
+-------------------------------------------
+Receives an image → extract CLIP + YOLO Pose → hybrid match → return top-k artworks.
 """
 
-from __future__ import annotations
-
-import io
-import logging
-from typing import List, Optional
-
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from typing import Optional
+import io
+import numpy as np
 from PIL import Image
 
-from .config import Settings
-from .model.pose_matcher import PoseMatcher
+import torch
+import open_clip
+
+from pathlib import Path
+
+from model.pose_matcher import PoseMatcher
+from utils_pose import encode_keypoints_to_pose_vector
 
 
-logger = logging.getLogger("uvicorn.error")
-
-# ----------------------------------------------------------------------
-# FastAPI app + CORS
-# ----------------------------------------------------------------------
-
-app = FastAPI(
-    title="Embodied Aesthetic Reconstruction — Backend API",
-    version="0.2.0",
-    description="CLIP + pose based portrait → artwork matching backend.",
-)
+# ----------------------------
+# App init
+# ----------------------------
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can tighten this later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global objects filled at startup
-settings: Optional[Settings] = None
-matcher: Optional[PoseMatcher] = None
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "data"
 
 
-# ----------------------------------------------------------------------
-# Startup / shutdown
-# ----------------------------------------------------------------------
+# ----------------------------
+# Load CLIP once
+# ----------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else
+                      ("mps" if torch.backends.mps.is_available() else "cpu"))
+
+print(f"[INFO] Using device: {device}")
+
+clip_model, clip_preprocess, _ = open_clip.create_model_and_transforms(
+    "ViT-B-32", pretrained="openai", device=device
+)
+clip_model.eval()
 
 
-@app.on_event("startup")
-def _startup_load() -> None:
-    """Load configuration + matcher once when the server starts."""
-    global settings, matcher
+# ----------------------------
+# Load YOLOv8-Pose once
+# ----------------------------
+from ultralytics import YOLO
 
-    logger.info("Loading Settings and PoseMatcher…")
-    settings = Settings()
-    matcher = PoseMatcher(settings)
-    logger.info("Matcher loaded successfully.")
+YOLO_MODEL_PATH = ROOT / "frontend" / "yolov8n-pose.pt"
+print(f"[INFO] Loading YOLO pose model: {YOLO_MODEL_PATH}")
 
-
-@app.on_event("shutdown")
-def _shutdown_cleanup() -> None:
-    """Optional cleanup (currently nothing special)."""
-    global matcher
-    matcher = None
-    logger.info("Matcher released.")
+pose_model = YOLO(str(YOLO_MODEL_PATH))
 
 
-# ----------------------------------------------------------------------
-# Simple health endpoint
-# ----------------------------------------------------------------------
+# ----------------------------
+# Load Hybrid Matcher
+# ----------------------------
+MUSEUM = "mixed"    # default museum
+matcher = PoseMatcher(DATA / MUSEUM, pose_weight=0.35, topk_default=10)
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "device": getattr(matcher, "device", "unknown") if matcher else "unloaded",
-        "default_museum": getattr(settings, "default_museum", None)
-        if settings
-        else None,
-        "pose_weight": getattr(settings, "pose_weight", None) if settings else None,
-    }
+# ============================================================
+# Helper: extract YOLO keypoints from image
+# ============================================================
+def extract_keypoints(pil: Image.Image) -> Optional[np.ndarray]:
+    """Return YOLO keypoints → (17, 2) xy and (17,) visibility."""
+    rgb = np.array(pil.convert("RGB"))
+    res = pose_model.predict(rgb, imgsz=640, device=str(device), verbose=False)
+
+    if len(res) == 0 or res[0].keypoints is None or len(res[0].keypoints) == 0:
+        return None
+
+    k = res[0].keypoints
+    xy = k.xy[0].cpu().numpy()  # (17,2)
+    conf = k.conf[0].cpu().numpy()  # (17,)
+
+    # normalize XY to [0,1]
+    h, w = rgb.shape[:2]
+    xy_norm = np.copy(xy)
+    xy_norm[:, 0] /= float(w)
+    xy_norm[:, 1] /= float(h)
+
+    return xy_norm, conf
 
 
-# ----------------------------------------------------------------------
-# Schemas for /match
-# ----------------------------------------------------------------------
-
-
-class MatchResult(BaseModel):
-    filename: str
-    title: Optional[str] = None
-    artist: Optional[str] = None
-    year: Optional[int] = None
-    score: float
-
-
-class MatchResponse(BaseModel):
-    museum: Optional[str]
-    topk: int
-    results: List[MatchResult]
-
-
-# ----------------------------------------------------------------------
-# Main matching endpoint
-# ----------------------------------------------------------------------
-
-
-@app.post("/match", response_model=MatchResponse)
-async def match(
-    image: UploadFile = File(..., description="Uploaded portrait photo"),
-    museum: Optional[str] = Form(None, description="Museum name (kept for compatibility)"),
-    topk: int = Form(3, description="Number of top results"),
+# ============================================================
+# API endpoint
+# ============================================================
+@app.post("/match")
+async def match_image(
+    image: UploadFile,
+    museum: Optional[str] = Form("mixed"),
+    topk: Optional[int] = Form(5),
 ):
-    """
-    Robust matching endpoint:
+    # load image
+    raw = await image.read()
+    pil = Image.open(io.BytesIO(raw)).convert("RGB")
 
-    - validates that the uploaded file looks like an image
-    - decodes it to a PIL image (RGB)
-    - calls PoseMatcher.match_pil(...)
-    - tries to back-fill missing title / artist / year from matcher.meta_by_filename
-    """
-    if topk <= 0:
-        topk = 3
+    # encode CLIP
+    clip_vec = clip_preprocess(pil).unsqueeze(0).to(device)
+    with torch.no_grad(), torch.autocast(device_type=str(device), enabled=(device.type in ["cuda", "mps"])):
+        feat = clip_model.encode_image(clip_vec)
+    q_clip = feat.float().cpu().numpy()
+    q_clip = q_clip / (np.linalg.norm(q_clip, axis=1, keepdims=True) + 1e-12)
 
-    if image.content_type is not None and not image.content_type.startswith("image/"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported content type: {image.content_type}. Please upload an image file.",
-        )
+    # YOLO Pose
+    kp = extract_keypoints(pil)
+    if kp is not None:
+        xy, vis = kp
+        q_pose = encode_keypoints_to_pose_vector(xy, vis).astype("float32")
+        q_pose = q_pose[None, :]
+        q_pose = q_pose / (np.linalg.norm(q_pose, axis=1, keepdims=True) + 1e-12)
+    else:
+        q_pose = None
 
-    data = await image.read()
-    if not data:
-        raise HTTPException(
-            status_code=400,
-            detail="Empty file received. Please take a photo again.",
-        )
+    # Hybrid match
+    results = matcher.match(q_clip, q_pose, topk=topk)
 
-    try:
-        pil_img = Image.open(io.BytesIO(data)).convert("RGB")
-    except Exception as exc:
-        logger.exception("Failed to decode uploaded image")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid image file: {type(exc).__name__}",
-        )
-
-    global matcher
-    if matcher is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Matcher is not loaded on the server.",
-        )
-
-    effective_museum = museum or getattr(matcher, "default_museum", None) or "mixed"
-
-    try:
-        if hasattr(matcher, "match_pil"):
-            raw_results = matcher.match_pil(
-                pil_img,
-                museum=effective_museum,
-                topk=topk,
-            )
-        else:
-            raise RuntimeError("PoseMatcher has no method 'match_pil'")
-    except ValueError as exc:
-        logger.exception("ValueError in matcher.match_pil")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Matching failed: {exc}",
-        )
-    except Exception as exc:
-        logger.exception("Unhandled error in matcher.match_pil")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal error during matching: {type(exc).__name__}: {exc}",
-        )
-
-    payload: List[MatchResult] = []
-
-    meta_store = getattr(matcher, "meta_by_filename", None)
-
-    def fill_from_meta(filename: str, title, artist, year):
-        """If title/artist/year are missing, try to fill from matcher metadata."""
-        nonlocal meta_store
-        if not isinstance(meta_store, dict):
-            return title, artist, year
-
-        meta = meta_store.get(filename) or meta_store.get(filename.strip()) or {}
-        if isinstance(meta, dict):
-            title = title or meta.get("title") or meta.get("Title")
-            artist = artist or meta.get("artist") or meta.get("Artist")
-            year = year or meta.get("year") or meta.get("Year")
-        else:
-            title = title or getattr(meta, "title", None)
-            artist = artist or getattr(meta, "artist", None)
-            year = year or getattr(meta, "year", None)
-        return title, artist, year
-
-    for r in raw_results or []:
-        if isinstance(r, dict):
-            filename = r.get("filename") or r.get("file") or ""
-            score = float(r.get("score", 0.0))
-            title = r.get("title")
-            artist = r.get("artist")
-            year = r.get("year")
-        else:
-            filename = getattr(r, "filename", "") or getattr(r, "file", "")
-            score = float(getattr(r, "score", 0.0))
-            title = getattr(r, "title", None)
-            artist = getattr(r, "artist", None)
-            year = getattr(r, "year", None)
-
-        title, artist, year = fill_from_meta(filename, title, artist, year)
-
-        # normalise year → int or None
-        try:
-            if isinstance(year, str) and year.strip():
-                year_int = int(year.split(",")[0].strip())
-            elif isinstance(year, (int, float)):
-                year_int = int(year)
-            else:
-                year_int = None
-        except Exception:
-            year_int = None
-
-        payload.append(
-            MatchResult(
-                filename=filename,
-                title=title,
-                artist=artist,
-                year=year_int,
-                score=score,
-            )
-        )
-
-    return MatchResponse(museum=effective_museum, topk=topk, results=payload)
+    return {"results": results, "museum": museum}
