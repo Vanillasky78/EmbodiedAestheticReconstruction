@@ -4,6 +4,7 @@ import io
 import os
 import time
 import threading
+import random
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -29,27 +30,22 @@ ROOT_DIR = FRONTEND_DIR.parent
 DATA_DIR = ROOT_DIR / "data" / "mixed"
 IMAGES_DIR = DATA_DIR / "images"
 
-# Meta CSV candidates (fallback to local)
+# Meta CSV candidates (fallback to local if needed)
 META_CSV_CANDIDATES = [
     DATA_DIR / "embeddings_meta.csv",
     ROOT_DIR / "data" / "local" / "portrait_works_enhanced_english.csv",
     ROOT_DIR / "data" / "local" / "portrait_works.csv",
 ]
 
-# Backend API
 DEFAULT_API_URL = "http://127.0.0.1:8000/match"
-
 APP_TITLE = "Embodied Aesthetic Reconstruction"
 
-# YOLO model path
 YOLO_MODEL_PATH = FRONTEND_DIR / "yolov8n-pose.pt"
 
-# WebRTC ICE config (Safari requires STUN)
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
-# Stillness & motion detection
 STILLNESS_SEC = 3.5
 MAX_BUF_SEC = 5.0
 FPS_ASSUMED = 12
@@ -57,12 +53,17 @@ MOTION_EPS_CXCY = 4.0
 MOTION_EPS_AREA = 0.03
 MIN_FACE_AREA = 0.06
 
-# Colors
 YELLOW = (255, 235, 59)
 BLACK = (0, 0, 0)
 HOT_PINK = (255, 30, 180)
 
 RIGHT_IMG_MAXW = 900
+
+# Diversity / randomness control
+MAX_RECENT = 6          # how many artworks to remember
+PRIMARY_TOP_K = 3       # "very best" range
+TAIL_TOP_K = 10         # search in top-10 in total
+TAIL_RANDOM_PROB = 0.3  # 30% chance to look into 4–10 first
 
 
 # =================== UTILITIES ===================
@@ -78,14 +79,14 @@ def load_meta_mapping() -> Dict[str, Dict]:
 
     import csv
 
-    rows = []
+    rows: List[Dict] = []
     for p in META_CSV_CANDIDATES:
         if p.exists():
             with open(p, "r", encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
             break
 
-    mapping = {}
+    mapping: Dict[str, Dict] = {}
     for r in rows:
         fname = (
             r.get("filename")
@@ -139,8 +140,10 @@ def _load_font(size: int = 40):
     return ImageFont.load_default()
 
 
-def draw_tiny_metrics_top_right(im: Image.Image, lines: List[str], size=16, margin=10):
-    """Small pink pose metrics in top-right corner of image."""
+def draw_tiny_metrics_top_right(
+    im: Image.Image, lines: List[str], size: int = 16, margin: int = 10
+) -> Image.Image:
+    """Small pink pose metrics in top-right corner of the image."""
     if not lines:
         return im
     img = im.copy()
@@ -155,12 +158,10 @@ def draw_tiny_metrics_top_right(im: Image.Image, lines: List[str], size=16, marg
 
     x = img.width - margin - wmax
     y = margin
-
     for s in lines:
         d.text((x, y), s, fill=HOT_PINK, font=font)
         _, _, _, b = d.textbbox((0, 0), s, font=font)
         y += int(b * 0.95)
-
     return img
 
 
@@ -203,12 +204,7 @@ def format_metrics(kps: Dict[int, Tuple[float, float] | None]) -> List[str]:
 
 
 def overlay_right_labels(painting: Image.Image, meta: Dict) -> Image.Image:
-    """
-    Exhibition-style yellow labels:
-    1. Price
-    2. Year
-    3. Artist
-    """
+    """Yellow label stack: price, year, artist."""
     im = painting.convert("RGB").copy()
     draw = ImageDraw.Draw(im)
 
@@ -235,7 +231,7 @@ def overlay_right_labels(painting: Image.Image, meta: Dict) -> Image.Image:
         w, h = r - l, b - t
 
         pad_x, pad_y = 16, 10
-        box_w, box_h = w + pad_x * 2, h + pad_y * 2
+        box_w, box_h = w + 2 * pad_x, h + 2 * pad_y
 
         x = margin_x
         draw.rectangle([x, y, x + box_w, y + box_h], fill=YELLOW)
@@ -247,7 +243,7 @@ def overlay_right_labels(painting: Image.Image, meta: Dict) -> Image.Image:
 
 
 def force_rerun():
-    """Compatible with new/old versions of Streamlit."""
+    """Compatible with new/old Streamlit."""
     try:
         st.rerun()
     except Exception:
@@ -261,6 +257,7 @@ def force_rerun():
 
 try:
     from ultralytics import YOLO
+
     HAS_YOLO = True
 except Exception:
     HAS_YOLO = False
@@ -272,7 +269,7 @@ class CuratorialProcessor(VideoProcessorBase):
     - blue bbox
     - green skeleton
     - pink tiny pose metrics
-    - stillness-based auto-capture
+    - stillness-based auto capture
     """
 
     def __init__(self):
@@ -299,7 +296,7 @@ class CuratorialProcessor(VideoProcessorBase):
 
         self.lock = threading.Lock()
 
-    def _detect_bbox(self, rgb):
+    def _detect_bbox(self, rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
         if not self.model:
             return None
         res = self.model.predict(rgb, imgsz=640, device="cpu", verbose=False)
@@ -311,10 +308,11 @@ class CuratorialProcessor(VideoProcessorBase):
         b = b.cpu().numpy()
         areas = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
         i = int(np.argmax(areas))
-        return tuple(b[i].astype(int).tolist())
+        x1, y1, x2, y2 = b[i].astype(int).tolist()
+        return x1, y1, x2, y2
 
-    def _extract_keypoints(self, res):
-        kps = {}
+    def _extract_keypoints(self, res) -> Dict[int, Tuple[float, float] | None]:
+        kps: Dict[int, Tuple[float, float] | None] = {}
         try:
             if res and res[0].keypoints is not None and len(res[0].keypoints) > 0:
                 xy = res[0].keypoints.xy[0].cpu().numpy()
@@ -329,7 +327,7 @@ class CuratorialProcessor(VideoProcessorBase):
         cx = 0.5 * (x1 + x2)
         cy = 0.5 * (y1 + y2)
         area = max(1.0, (x2 - x1) * (y2 - y1))
-        rel_area = area / (w * h)
+        rel_area = area / float(w * h)
 
         if rel_area < MIN_FACE_AREA:
             self.last_stable_ts = None
@@ -347,15 +345,14 @@ class CuratorialProcessor(VideoProcessorBase):
         stdx = float(np.std(self.cx_buf))
         stdy = float(np.std(self.cy_buf))
         stda = float(np.std(self.area_buf))
-
-        stable = (
+        stable_now = (
             stdx < MOTION_EPS_CXCY
             and stdy < MOTION_EPS_CXCY
             and stda < MOTION_EPS_AREA
         )
 
         now = time.time()
-        if stable:
+        if stable_now:
             if self.last_stable_ts is None:
                 self.last_stable_ts = now
             return (now - self.last_stable_ts) >= STILLNESS_SEC
@@ -389,17 +386,15 @@ class CuratorialProcessor(VideoProcessorBase):
             plotted = res[0].plot()[:, :, ::-1]
             kps = self._extract_keypoints(res)
             lines = format_metrics(kps)
-
             with self.lock:
                 self.last_metrics_lines = lines
-
             pil = Image.fromarray(plotted)
             pil = draw_tiny_metrics_top_right(pil, lines, size=16, margin=10)
             out_rgb = np.array(pil)
         else:
-            out_rgb = img_rgb
             with self.lock:
                 self.last_metrics_lines = ["(pose model unavailable)"]
+            out_rgb = img_rgb
 
         bbox = self._detect_bbox(img_rgb) if self.model else None
         if bbox and self._update_stillness(bbox, w, h):
@@ -420,29 +415,47 @@ st.markdown(
 <style>
 section[data-testid="stSidebar"] {{ display: none !important; }}
 header, footer, [data-testid="stToolbar"] {{ visibility: hidden !important; }}
-.block-container {{ padding-top: 0.6rem; padding-bottom: 0.6rem; max-width: 1700px; }}
+
+body {{
+  background-color: #f5f5f7;
+}}
+.block-container {{
+  padding-top: 0.6rem;
+  padding-bottom: 0.6rem;
+  max-width: 1700px;
+}}
+
+h1 {{
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+}}
 
 .left-col .cam-wrap {{
   position: relative;
-  height: 80vh;               /* was 92vh */
+  height: 80vh;
   width: 100%;
   overflow: hidden;
-  border-radius: 12px;
+  border-radius: 18px;
   background: #111;
+  box-shadow: 0 18px 45px rgba(0,0,0,0.3);
 }}
 .left-col .cam-wrap video {{
   height: 100% !important;
   width: auto !important;
   object-fit: cover !important;
-  border-radius: 12px !important;
+  border-radius: 18px !important;
 }}
 
 .right-col .art-wrap {{
   position: relative;
-  height: 80vh;               /* was 92vh */
+  height: 80vh;
   max-width: {RIGHT_IMG_MAXW}px;
   overflow: hidden;
   margin: 0 auto;
+  border-radius: 18px;
+  background: #050505;
+  box-shadow: 0 18px 45px rgba(0,0,0,0.35);
 }}
 .right-col .art-wrap img {{
   display: block;
@@ -450,6 +463,11 @@ header, footer, [data-testid="stToolbar"] {{ visibility: hidden !important; }}
   height: 100% !important;
   object-fit: cover !important;
 }}
+
+button[kind="secondary"] {{
+  border-radius: 999px !important;
+}}
+
 </style>
 """,
     unsafe_allow_html=True,
@@ -458,11 +476,11 @@ header, footer, [data-testid="stToolbar"] {{ visibility: hidden !important; }}
 st.title(APP_TITLE)
 st.caption(
     "Hold still for ~3–5 seconds to auto-capture, or press the button to capture manually. "
-    "Left: live video with pose. Right: matched artwork with tiny pink metrics."
+    "Left: live video with pose. Right: matched artwork with tiny pink pose metrics."
 )
 
 try:
-    st.autorefresh(interval=700, key="auto", limit=None)
+    st.autorefresh(interval=700, key="ear_auto", limit=None)
 except Exception:
     pass
 
@@ -476,6 +494,8 @@ if "last_metrics" not in st.session_state:
     st.session_state["last_metrics"] = []
 if "last_ts" not in st.session_state:
     st.session_state["last_ts"] = 0.0
+if "recent_files" not in st.session_state:
+    st.session_state["recent_files"] = []  # type: List[str]
 
 API_URL = DEFAULT_API_URL
 
@@ -555,7 +575,8 @@ with right:
             buf.seek(0)
 
             files = {"image": ("frame.jpg", buf.getvalue(), "image/jpeg")}
-            data = {"museum": "mixed", "topk": 3}
+            # Ask backend for Top-10, we'll do diversity selection here
+            data = {"museum": "mixed", "topk": TAIL_TOP_K}
 
             try:
                 resp = requests.post(API_URL, files=files, data=data, timeout=30)
@@ -577,8 +598,54 @@ with right:
             if not results:
                 ph.warning("No matches returned.")
             else:
-                top = results[0]
-                filename = top.get("filename") or top.get("file")
+                recent = st.session_state.get("recent_files", [])
+
+                # ---------- diversity + mild randomness ----------
+                # Decide whether to start looking from the tail (ranks 4–10)
+                use_tail_first = random.random() < TAIL_RANDOM_PROB and len(results) > PRIMARY_TOP_K
+                primary_slice = results[:PRIMARY_TOP_K]
+                tail_slice = results[PRIMARY_TOP_K:TAIL_TOP_K]
+
+                ordered_candidates = (
+                    (tail_slice + primary_slice) if use_tail_first else (primary_slice + tail_slice)
+                )
+
+                chosen = None
+                chosen_fname = None
+
+                for r in ordered_candidates:
+                    fname = (
+                        r.get("filename")
+                        or r.get("file")
+                        or r.get("image_path")
+                        or r.get("path")
+                    )
+                    if not fname:
+                        continue
+                    if fname not in recent:
+                        chosen = r
+                        chosen_fname = fname
+                        break
+
+                # Fallback: if all candidates are "recent", use strict Top-1
+                if chosen is None:
+                    chosen = results[0]
+                    chosen_fname = (
+                        chosen.get("filename")
+                        or chosen.get("file")
+                        or chosen.get("image_path")
+                        or chosen.get("path")
+                    )
+
+                # Update recent memory
+                if chosen_fname:
+                    if chosen_fname in recent:
+                        recent.remove(chosen_fname)
+                    recent.insert(0, chosen_fname)
+                    del recent[MAX_RECENT:]
+                    st.session_state["recent_files"] = recent
+
+                filename = chosen_fname
 
                 img_path = ensure_image_path(filename or "")
                 if not img_path:
@@ -591,18 +658,17 @@ with right:
                         meta_row = lookup_meta(str(filename))
                         meta = {
                             "artist": meta_row.get("artist")
-                            or top.get("artist")
+                            or chosen.get("artist")
                             or "artist name",
-                            "year": meta_row.get("year") or top.get("year") or "",
+                            "year": meta_row.get("year") or chosen.get("year") or "",
                             "price_text": meta_row.get("price_text")
                             or meta_row.get("auction_price_usd")
                             or "",
                         }
 
                         painted = overlay_right_labels(painting, meta)
-
                         metrics = st.session_state.get("last_metrics") or []
-                        painted = draw_tiny_metrics_top_right(painted, metrics, size=16)
+                        painted = draw_tiny_metrics_top_right(painted, metrics, size=16, margin=12)
 
                         w = min(RIGHT_IMG_MAXW, painted.width)
                         caption = f"{meta_row.get('title','')} — {meta.get('artist','')}"
