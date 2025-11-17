@@ -1,248 +1,165 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-PoseMatcher
+Hybrid Pose+CLIP Matcher
+------------------------
+This module performs a hybrid similarity search over a museum dataset.
 
-CLIP-based matcher with optional *pose embeddings* re-weighting:
+Data folder layout (per museum):
+    data/<museum>/
+        embeddings.npy          # (N, D_clip)
+        pose_embeddings.npy     # (N, D_pose)   ← optional
+        embeddings_meta.csv     # filenames + metadata
 
-- loads CLIP embeddings from data/.../embeddings.npy
-- loads optional pose embeddings from data/.../pose_embeddings.npy
-- loads metadata from data/.../embeddings_meta.csv
-- computes query CLIP (and pose) embeddings for the uploaded image
-- mixes scores: (1 - pose_weight) * clip + pose_weight * pose
-- returns Top-K matched artworks with their metadata
+Final score:
+    final = (1 - POSE_WEIGHT) * clip_sim + (POSE_WEIGHT) * pose_sim
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional
-
+import os
+import json
 import numpy as np
-import open_clip
-import torch
-from PIL import Image
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-from backend.config import Settings
-
-
-@dataclass
-class MatchItem:
-    filename: str
-    title: Optional[str]
-    artist: Optional[str]
-    year: Optional[int]
-    score: float
+from .utils import normalize_rows, cosine_similarity_matrix
 
 
 class PoseMatcher:
-    def __init__(self, settings: Settings):
-        self.settings = settings
+    """
+    Hybrid matcher combining CLIP embeddings + Pose embeddings.
+    """
 
-        # --------- Resolve device ----------
-        if settings.device == "cpu":
-            device = "cpu"
-        elif settings.device == "cuda" and torch.cuda.is_available():
-            device = "cuda"
-        elif settings.device == "mps" and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            # "auto" or unsupported → try CUDA, then MPS, then CPU
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
-        self.device = torch.device(device)
+    def __init__(
+        self,
+        museum_dir: Path,
+        pose_weight: float = 0.35,        # You can tune this
+        topk_default: int = 3,
+    ):
+        self.museum_dir = museum_dir
+        self.pose_weight = float(pose_weight)
+        self.topk_default = int(topk_default)
 
-        # --------- Load CLIP model ----------
-        # Must match build_embeddings.py
-        self.model, self.preprocess, _ = open_clip.create_model_and_transforms(
-            "ViT-B-32",
-            pretrained="openai",
-            device=self.device,
-        )
-        self.model.eval()
+        # Load embeddings
+        emb_path = museum_dir / "embeddings.npy"
+        meta_path = museum_dir / "embeddings_meta.csv"
+        pose_path = museum_dir / "pose_embeddings.npy"
 
-        # --------- Load CLIP embeddings ----------
-        emb_path = settings.embeddings_path
         if not emb_path.exists():
-            raise FileNotFoundError(f"Embeddings file not found: {emb_path}")
+            raise FileNotFoundError(f"Missing embeddings: {emb_path}")
 
-        emb_np = np.load(emb_path)
-        if isinstance(emb_np, np.lib.npyio.NpzFile):
-            emb_np = emb_np["embeddings"]
+        self.clip_emb = np.load(emb_path).astype("float32")
+        self.clip_emb = normalize_rows(self.clip_emb)
 
-        emb = torch.from_numpy(emb_np).float()
-        emb = emb / (emb.norm(dim=-1, keepdim=True) + 1e-8)
-        self.embeddings = emb.to(self.device)  # (N, D_clip)
+        # Metadata
+        self.meta = self._load_meta_rows(meta_path)
 
-        # --------- Load pose embeddings (optional) ----------
-        self.pose_embeddings: Optional[torch.Tensor] = None
-        self.pose_weight: float = float(settings.pose_weight)
-
-        pose_path: Path = settings.pose_embeddings_path
+        # Pose embeddings (optional)
         if pose_path.exists():
-            pose_np = np.load(pose_path)
-            # basic sanity check: same number of rows as CLIP embeddings
-            if pose_np.shape[0] == emb_np.shape[0]:
-                pose = torch.from_numpy(pose_np).float()
-                pose = pose / (pose.norm(dim=-1, keepdim=True) + 1e-8)
-                self.pose_embeddings = pose.to(self.device)  # (N, D_pose)
-            else:
-                print(
-                    f"[WARN] pose_embeddings shape {pose_np.shape} "
-                    f"does not match embeddings {emb_np.shape}; ignoring pose features."
-                )
+            print(f"[INFO] Pose embeddings found at {pose_path}")
+            self.pose_emb = np.load(pose_path).astype("float32")
+            self.pose_emb = normalize_rows(self.pose_emb)
+            self.has_pose = True
         else:
-            # Not an error: we simply fall back to CLIP-only
-            print(f"[INFO] pose_embeddings not found at {pose_path}, using CLIP-only scores.")
+            print(f"[INFO] No pose_embeddings.npy → using CLIP-only mode")
+            self.pose_emb = None
+            self.has_pose = False
 
-        # --------- Load metadata ----------
-        meta_path = settings.embeddings_meta_path
-        if not meta_path.exists():
-            raise FileNotFoundError(f"Metadata CSV not found: {meta_path}")
-
-        self.meta: List[Dict] = []
-        self.meta_by_filename: Dict[str, Dict] = {}
-
-        with meta_path.open("r", encoding="utf-8") as f:
-            header = f.readline().strip().split(",")
-            for line in f:
-                parts = [p.strip() for p in line.strip().split(",")]
-                if not parts or not parts[0]:
-                    continue
-                row = dict(zip(header, parts))
-                filename = row.get("filename") or row.get("file") or ""
-                if not filename:
-                    continue
-
-                # Normalize year to int if possible
-                raw_year = row.get("year") or row.get("Year")
-                year_int: Optional[int] = None
-                if raw_year:
-                    try:
-                        year_int = int(str(raw_year).split(",")[0].strip())
-                    except Exception:
-                        year_int = None
-
-                meta_entry = {
-                    "filename": filename,
-                    "title": row.get("title") or row.get("Title"),
-                    "artist": row.get("artist") or row.get("Artist"),
-                    "year": year_int,
-                    # keep all raw columns in case we need them later
-                    **row,
-                }
-                self.meta.append(meta_entry)
-                self.meta_by_filename[filename] = meta_entry
-
-        # For compatibility with backend.main
-        self.default_museum = settings.default_museum
-
-    # ------------------------------------------------------------------
-    # Encoding helpers
-    # ------------------------------------------------------------------
-    def _encode_image(self, image: Image.Image) -> torch.Tensor:
-        """
-        Encode a PIL image into a normalized CLIP embedding (1, D_clip).
-        """
-        img = self.preprocess(image).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            feat = self.model.encode_image(img)
-        feat = feat / (feat.norm(dim=-1, keepdim=True) + 1e-8)
-        return feat  # (1, D_clip)
-
-    def _encode_pose(self, image: Image.Image) -> torch.Tensor:
-        """
-        Encode pose-style features for the image.
-
-        For now this is implemented as the same CLIP encoder
-        (so that everything runs out-of-the-box). Later you can
-        replace this with a dedicated pose encoder or a vector
-        built from YOLO keypoints.
-
-        Shape: (1, D_pose) — must match pose_embeddings' last dim.
-        """
-        # Placeholder implementation = CLIP features again
-        return self._encode_image(image)
-
-    # ------------------------------------------------------------------
-    # Public APIs
-    # ------------------------------------------------------------------
-    def match_pil(
-        self,
-        image: Image.Image,
-        museum: Optional[str] = None,
-        topk: int = 3,
-    ) -> List[Dict]:
-        """
-        Match a PIL image against the stored embeddings.
-
-        Returns a list of dicts:
-            { "filename": ..., "title": ..., "artist": ..., "year": ..., "score": ... }
-        """
-        if topk <= 0:
-            topk = 3
-
-        # ---- CLIP similarity ----
-        q_clip = self._encode_image(image)  # (1, D_clip)
-        sims_clip = (self.embeddings @ q_clip.T).squeeze(1)  # (N,)
-
-        # ---- pose similarity (optional) ----
-        if self.pose_embeddings is not None and self.pose_weight > 0.0:
-            q_pose = self._encode_pose(image)  # (1, D_pose)
-            # if dims mismatch, fall back to CLIP-only
-            if q_pose.shape[1] == self.pose_embeddings.shape[1]:
-                sims_pose = (self.pose_embeddings @ q_pose.T).squeeze(1)
-                alpha = float(self.pose_weight)
-                sims = (1.0 - alpha) * sims_clip + alpha * sims_pose
-            else:
-                print(
-                    f"[WARN] pose dim mismatch: query={q_pose.shape}, "
-                    f"embeddings={self.pose_embeddings.shape}; using CLIP-only."
-                )
-                sims = sims_clip
-        else:
-            sims = sims_clip
-
-        # Top-K indices
-        k = min(topk, sims.shape[0])
-        scores, indices = torch.topk(sims, k=k, largest=True, sorted=True)
-
-        results: List[Dict] = []
-        for score, idx in zip(scores.tolist(), indices.tolist()):
-            if 0 <= idx < len(self.meta):
-                meta = self.meta[idx]
-            else:
-                meta = {}
-
-            filename = meta.get("filename", "")
-            title = meta.get("title")
-            artist = meta.get("artist")
-            year = meta.get("year")
-
-            results.append(
-                {
-                    "filename": filename,
-                    "title": title,
-                    "artist": artist,
-                    "year": year,
-                    "score": float(score),
-                }
+        # Basic sanity checks
+        if len(self.meta) != len(self.clip_emb):
+            raise ValueError(
+                f"Metadata length {len(self.meta)} != embeddings length {len(self.clip_emb)}"
             )
-        return results
+        if self.has_pose and len(self.pose_emb) != len(self.clip_emb):
+            raise ValueError(
+                f"Pose embeddings length {len(self.pose_emb)} != CLIP embeddings length {len(self.clip_emb)}"
+            )
 
-    def match_image_bytes(
+        print(
+            f"[OK] Loaded museum='{museum_dir.name}' "
+            f"→ N={len(self.clip_emb)}, pose={self.has_pose}"
+        )
+
+    # -------------------------------------------------------------
+    def _load_meta_rows(self, path: Path) -> List[Dict]:
+        import csv
+
+        if not path.exists():
+            raise FileNotFoundError(f"Metadata CSV not found: {path}")
+
+        rows = []
+        with open(path, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                rows.append(row)
+        return rows
+
+    # -------------------------------------------------------------
+    def encode_query_image(self, pil, clip_model, preprocess, device):
+        """
+        Encode query image using CLIP image encoder.
+        """
+        import torch
+
+        x = preprocess(pil).unsqueeze(0).to(device)
+        with torch.no_grad(), torch.autocast(device_type=str(device), enabled=(device.type in ["cuda", "mps"])):
+            feat = clip_model.encode_image(x)
+        feat = feat.float().cpu().numpy()
+        feat = normalize_rows(feat)
+        return feat  # (1, D)
+
+    # -------------------------------------------------------------
+    def compute_pose_for_query(self, kp_vec: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """
+        You pass in a (D_pose,) vector computed from YOLO keypoints.
+        This function simply normalizes it.
+        """
+        if kp_vec is None or not self.has_pose:
+            return None
+        v = kp_vec.astype("float32")[None, :]
+        v = normalize_rows(v)
+        return v  # (1, D_pose)
+
+    # -------------------------------------------------------------
+    def match(
         self,
-        image_bytes: bytes,
-        museum: Optional[str] = None,
-        topk: int = 3,
+        clip_query_vec: np.ndarray,
+        pose_query_vec: Optional[np.ndarray] = None,
+        topk: Optional[int] = None,
     ) -> List[Dict]:
-        """
-        Convenience wrapper used by the purely local Streamlit curatorial app.
-        """
-        from io import BytesIO
 
-        pil = Image.open(BytesIO(image_bytes)).convert("RGB")
-        return self.match_pil(pil, museum=museum, topk=topk)
+        if topk is None:
+            topk = self.topk_default
+
+        # --- 1) CLIP similarity
+        sim_clip = (self.clip_emb @ clip_query_vec.T).reshape(-1)
+
+        # --- 2) Pose similarity (if enabled)
+        if self.has_pose and pose_query_vec is not None:
+            sim_pose = (self.pose_emb @ pose_query_vec.T).reshape(-1)
+        else:
+            sim_pose = None
+
+        # --- 3) Hybrid scoring
+        if sim_pose is not None:
+            w = self.pose_weight
+            final = (1.0 - w) * sim_clip + w * sim_pose
+        else:
+            final = sim_clip
+
+        # --- 4) Sort
+        idx = np.argsort(final)[::-1][:topk]
+
+        # --- 5) Pack results
+        out = []
+        for i in idx:
+            row = self.meta[i]
+            out.append(
+                dict(
+                    filename=row.get("filename") or row.get("file"),
+                    score=float(final[i]),
+                    clip=float(sim_clip[i]),
+                    pose=float(sim_pose[i]) if sim_pose is not None else None,
+                    meta=row,
+                )
+            )
+        return out
