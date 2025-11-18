@@ -1,200 +1,228 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
 build_pose_embeddings.py
--------------------------
-Generate pose-based embeddings for all artworks using YOLOv8-Pose.
+------------------------
 
-Output:
-    data/mixed/pose_embeddings.npy
-    (same row ordering as embeddings_meta.csv)
+Offline script to build pose_embeddings.npy for a given museum folder.
 
-Usage:
-    conda activate ear-mvp
-    python backend/tools/build_pose_embeddings.py --data-root data/mixed
+Expected layout:
+
+    data/<museum>/
+        images/                 # artwork images
+        embeddings_meta.csv     # at least has a "filename" column
+
+This script will:
+
+  1. Load YOLOv8-Pose.
+  2. For each row in embeddings_meta.csv:
+       - open the corresponding image
+       - run YOLOv8-Pose to get keypoints
+       - convert keypoints -> 1D pose vector (encode_keypoints_to_pose_vector)
+  3. Save:
+       data/<museum>/pose_embeddings.npy   (N, D_pose)
+       data/<museum>/pose_meta.csv         (rows that had valid pose vectors)
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
+from typing import List, Dict, Optional
+
 import numpy as np
 from PIL import Image
-import json
-from tqdm import tqdm
 
-# YOLOv8-Pose
-try:
-    from ultralytics import YOLO
-except Exception as exc:
-    raise RuntimeError("Ultralytics YOLO is required. `pip install ultralytics`.") from exc
+import torch
+from ultralytics import YOLO
+
+# Import our pose encoder helper
+from backend.utils_pose import encode_keypoints_to_pose_vector
 
 
-# -------------------------
-# Pose vector utilities
-# -------------------------
-
-def encode_pose_keypoints(kps: np.ndarray | None, img_w: int, img_h: int) -> np.ndarray:
+# ------------------------------------------------------------
+# Helper: run YOLOv8-Pose and encode to 1D pose vector
+# ------------------------------------------------------------
+def extract_pose_vector(
+    pil_img: Image.Image,
+    model: YOLO,
+    device: torch.device,
+) -> Optional[np.ndarray]:
     """
-    Convert raw keypoints (N x 3: x,y,confidence) into a fixed pose vector.
+    Run YOLOv8-Pose on a PIL image and convert keypoints to a 1D pose vector.
 
-    We encode:
-      - normalized coordinates (x/img_w, y/img_h)
-      - per-joint existence mask
-      - joint angle features
+    Returns
+    -------
+    pose_vec : np.ndarray or None
+        1D numpy array (D_pose,) if detection succeeded, else None.
     """
+    rgb = np.array(pil_img.convert("RGB"))
 
-    num_joints = 17  # YOLOv8 Pose has 17 keypoints (0..16)
-    if kps is None:
-        # No detection → zero vector
-        return np.zeros(num_joints * 4, dtype=np.float32)
+    # Always run YOLO on the given device (we typically choose CPU for MPS safety)
+    results = model.predict(rgb, imgsz=640, device=str(device), verbose=False)
 
-    # If YOLO returns more than one person, we take the one with largest area
-    # but build_embeddings will only run on artwork images (static), so 1 person is expected.
-    if len(kps.shape) == 3:  # shape [num_people, 17, 3]
-        kps = kps[0]
+    if len(results) == 0 or results[0].keypoints is None or len(results[0].keypoints) == 0:
+        return None
 
-    # Prepare vector components
-    coord_vec = np.zeros((num_joints, 2), dtype=np.float32)
-    mask_vec  = np.zeros((num_joints, 1), dtype=np.float32)
-    angle_vec = np.zeros((num_joints, 1), dtype=np.float32)
+    kpts = results[0].keypoints
 
-    # Normalize
-    for i in range(num_joints):
-        x, y, conf = kps[i]
-        if conf > 0.1:
-            coord_vec[i] = np.array([x / img_w, y / img_h])
-            mask_vec[i] = 1.0
-        else:
-            coord_vec[i] = 0.0
-            mask_vec[i] = 0.0
+    # (17, 2) keypoint coordinates
+    xy = kpts.xy[0].cpu().numpy().astype("float32")
 
-    # Compute simple limb angles (example: shoulders/elbows/wrists)
-    # We encode angle at elbow and knee joints for stability
-    def safe_angle(a, b, c):
-        """Return angle ABC in radians."""
-        if (a is None) or (b is None) or (c is None):
-            return 0.0
-        ax, ay = a
-        bx, by = b
-        cx, cy = c
-        v1 = np.array([ax - bx, ay - by])
-        v2 = np.array([cx - bx, cy - by])
-        n1 = np.linalg.norm(v1)
-        n2 = np.linalg.norm(v2)
-        if n1 < 1e-6 or n2 < 1e-6:
-            return 0.0
-        cosv = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
-        return float(np.arccos(cosv))  # radians
+    # Confidence can be None on some Ultralytics versions → fall back to all-ones
+    if getattr(kpts, "conf", None) is not None:
+        conf = kpts.conf[0].cpu().numpy().astype("float32")  # (17,)
+    else:
+        conf = np.ones(xy.shape[0], dtype="float32")
 
-    # Joint indices follow COCO:
-    # 5: left shoulder, 6: right shoulder
-    # 7: left elbow,    8: right elbow
-    # 9: left wrist,   10: right wrist
-    # 11: left hip,    12: right hip
-    # 13: left knee,   14: right knee
-    # 15: left ankle,  16: right ankle
+    h, w = rgb.shape[:2]
+    xy_norm = xy.copy()
+    xy_norm[:, 0] /= float(w)
+    xy_norm[:, 1] /= float(h)
 
-    joints = kps[:, :2]
-    def jp(idx):
-        x, y, conf = kps[idx]
-        return (x, y) if conf > 0.1 else None
+    # Our project’s helper: (xy_norm, conf) -> 1D vector
+    pose_vec_1d = encode_keypoints_to_pose_vector(xy_norm, conf)
+    if pose_vec_1d is None:
+        return None
 
-    # elbow angles
-    angle_vec[7]  = safe_angle(jp(5), jp(7), jp(9))
-    angle_vec[8]  = safe_angle(jp(6), jp(8), jp(10))
-
-    # knee angles
-    angle_vec[13] = safe_angle(jp(11), jp(13), jp(15))
-    angle_vec[14] = safe_angle(jp(12), jp(14), jp(16))
-
-    # Flatten
-    return np.concatenate([
-        coord_vec.reshape(-1),
-        mask_vec.reshape(-1),
-        angle_vec.reshape(-1),
-    ]).astype(np.float32)
+    return pose_vec_1d.astype("float32")
 
 
-# -------------------------
-# Main build function
-# -------------------------
-
-def build_pose_embeddings(data_root: Path, model_path: Path):
-    meta_path = data_root / "embeddings_meta.csv"
-    images_dir = data_root / "images"
-
-    if not meta_path.exists():
-        raise FileNotFoundError(f"Missing: {meta_path}")
-
-    # Load metadata rows in order
-    import csv
-    with open(meta_path, "r", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-
-    print(f"[INFO] Loaded {len(rows)} metadata rows.")
-
-    # Init YOLO pose model
-    print(f"[INFO] Loading YOLOv8-Pose: {model_path}")
-    model = YOLO(str(model_path))
-
-    pose_vectors = []
-
-    for row in tqdm(rows, desc="Building pose vectors"):
-        fname = (
-            row.get("filename")
-            or row.get("image_path")
-            or row.get("path")
-            or row.get("file")
-        )
-        if not fname:
-            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
-            continue
-
-        img_path = images_dir / fname
-        if not img_path.exists():
-            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
-            continue
-
-        try:
-            img = Image.open(img_path).convert("RGB")
-        except Exception:
-            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
-            continue
-
-        w, h = img.size
-        img_np = np.array(img)
-
-        # YOLO pose inference
-        res = model.predict(img_np, imgsz=640, device="cpu", verbose=False)
-        if len(res) == 0 or res[0].keypoints is None:
-            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
-            continue
-
-        kps = res[0].keypoints.cpu().numpy()  # shape: [1, 17, 3]
-        vec = encode_pose_keypoints(kps, w, h)
-        pose_vectors.append(vec)
-
-    pose_vectors = np.stack(pose_vectors, axis=0)
-    out_path = data_root / "pose_embeddings.npy"
-
-    np.save(out_path, pose_vectors)
-    print(f"[OK] Saved pose embeddings → {out_path}")
-    print(f"[INFO] shape = {pose_vectors.shape} (rows match embeddings_meta.csv)")
-
-
-# -------------------------
-# CLI
-# -------------------------
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", type=str, default="data/mixed",
-                        help="path to dataset folder that contains images/ and embeddings_meta.csv")
-    parser.add_argument("--yolo-model", type=str, default="frontend/yolov8n-pose.pt",
-                        help="path to YOLOv8-Pose .pt file")
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Build pose_embeddings.npy for a museum folder.")
+    parser.add_argument(
+        "--museum_dir",
+        type=str,
+        required=True,
+        help="Path to museum directory, e.g. data/aic or data/local",
+    )
+    parser.add_argument(
+        "--yolo",
+        type=str,
+        default="yolov8n-pose.pt",
+        help="YOLOv8-Pose weights file (relative or absolute path).",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",  # safer than MPS for pose on Apple
+        help='Device to run YOLO on: "cpu", "cuda", or "mps". Default = "cpu".',
+    )
 
     args = parser.parse_args()
 
-    build_pose_embeddings(
-        Path(args.data_root),
-        Path(args.yolo_model),
-    )
+    museum_dir = Path(args.museum_dir).resolve()
+    if not museum_dir.exists():
+        raise FileNotFoundError(f"Museum dir not found: {museum_dir}")
+
+    meta_csv = museum_dir / "embeddings_meta.csv"
+    images_dir = museum_dir / "images"
+
+    if not meta_csv.exists():
+        raise FileNotFoundError(f"Metadata CSV not found: {meta_csv}")
+    if not images_dir.exists():
+        raise FileNotFoundError(f"Images dir not found: {images_dir}")
+
+    print(f"[INFO] Loaded metadata from: {meta_csv}")
+    print(f"[INFO] Images dir: {images_dir}")
+
+    # -------- device --------
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("[WARN] CUDA requested but not available, falling back to CPU.")
+        device = torch.device("cpu")
+    elif args.device == "mps" and not (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
+        print("[WARN] MPS requested but not available, falling back to CPU.")
+        device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+
+    print(f"[INFO] Using device: {device}")
+
+    # -------- YOLO model --------
+    yolo_path = Path(args.yolo)
+    if not yolo_path.exists():
+        # also try museum_dir parent / repo-root
+        repo_root = museum_dir.parents[2]  # EmbodiedAestheticReconstruction/
+        alt = repo_root / "yolov8n-pose.pt"
+        if alt.exists():
+            yolo_path = alt
+        else:
+            raise FileNotFoundError(f"YOLO weights not found: {args.yolo}")
+
+    print(f"[INFO] Loading YOLO model: {yolo_path}")
+    model = YOLO(str(yolo_path))
+
+    # -------- read metadata rows --------
+    rows: List[Dict] = []
+    with open(meta_csv, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append(r)
+
+    print(f"[INFO] Total rows in metadata: {len(rows)}")
+
+    pose_vectors: List[np.ndarray] = []
+    kept_rows: List[Dict] = []
+
+    for i, r in enumerate(rows):
+        fname = (
+            r.get("filename")
+            or r.get("file")
+            or r.get("image_path")
+            or r.get("path")
+        )
+        if not fname:
+            continue
+
+        img_path = Path(fname)
+        if not img_path.is_absolute():
+            img_path = images_dir / img_path
+
+        if not img_path.exists():
+            print(f"[WARN] Missing image file: {img_path}")
+            continue
+
+        try:
+            pil = Image.open(img_path).convert("RGB")
+        except Exception as exc:
+            print(f"[WARN] Failed to open {img_path}: {exc}")
+            continue
+
+        pose_vec = extract_pose_vector(pil, model, device)
+        if pose_vec is None:
+            # no reliable person / keypoints in this image
+            continue
+
+        pose_vectors.append(pose_vec)
+        kept_rows.append(r)
+
+        if (i + 1) % 50 == 0:
+            print(f"[INFO] Processed {i+1}/{len(rows)} rows… kept {len(kept_rows)}")
+
+    if len(pose_vectors) == 0:
+        raise RuntimeError("No pose vectors generated. Check YOLO model / images.")
+
+    pose_arr = np.stack(pose_vectors, axis=0)
+    out_pose = museum_dir / "pose_embeddings.npy"
+    np.save(out_pose, pose_arr)
+    print(f"[OK] Saved pose embeddings: {out_pose} (shape={pose_arr.shape})")
+
+    out_csv = museum_dir / "pose_meta.csv"
+    with open(out_csv, "w", encoding="utf-8", newline="") as f:
+        writer = None
+        for r in kept_rows:
+            if writer is None:
+                writer = csv.DictWriter(f, fieldnames=list(r.keys()))
+                writer.writeheader()
+            writer.writerow(r)
+
+    print(f"[OK] Saved pose metadata: {out_csv} (rows={len(kept_rows)})")
+
+
+if __name__ == "__main__":
+    main()
