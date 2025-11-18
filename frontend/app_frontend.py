@@ -26,9 +26,17 @@ from streamlit_webrtc import (
 FRONTEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = FRONTEND_DIR.parent
 
-# Use GLOBAL MIXED INDEX (local + met merged)
+# Use GLOBAL MIXED INDEX (local + met + aic merged)
 DATA_DIR = ROOT_DIR / "data" / "mixed"
 IMAGES_DIR = DATA_DIR / "images"
+
+# All museum image roots (search order)
+MUSEUM_IMAGE_DIRS = [
+    DATA_DIR / "images",                    # mixed
+    ROOT_DIR / "data" / "local" / "images",
+    ROOT_DIR / "data" / "met" / "images",
+    ROOT_DIR / "data" / "aic" / "images",
+]
 
 # Meta CSV candidates (fallback to local if needed)
 META_CSV_CANDIDATES = [
@@ -114,12 +122,40 @@ def safe_open_image(p: Path) -> Optional[Image.Image]:
 
 
 def ensure_image_path(filename: str) -> Optional[Path]:
+    """
+    Resolve an artwork filename to a real image path.
+
+    Strategy:
+      1) If it's an absolute existing path → return.
+      2) If it has subdirectories, try relative to project root / data.
+      3) Otherwise, search by basename in all known museum image dirs.
+    """
     if not filename:
         return None
+
     p = Path(filename)
-    if not p.is_absolute():
-        p = IMAGES_DIR / p
-    return p if p.exists() else None
+
+    # 1) absolute path already
+    if p.is_absolute() and p.exists():
+        return p
+
+    candidates: List[Path] = []
+
+    # 2) has subdirectory component (e.g. "aic/images/aic_4939.jpg")
+    if p.parent != Path("."):
+        candidates.append(ROOT_DIR / p)
+        candidates.append(ROOT_DIR / "data" / p)
+
+    # 3) search by basename across all museum image roots
+    basename = p.name
+    for root in MUSEUM_IMAGE_DIRS:
+        candidates.append(root / basename)
+
+    for c in candidates:
+        if c.exists():
+            return c
+
+    return None
 
 
 def _load_font(size: int = 40):
@@ -549,6 +585,16 @@ with left:
 
 with right:
     st.subheader("Matched artwork")
+
+    # Match mode control
+    match_mode = st.selectbox(
+        "Match mode",
+        ["default", "portrait_only", "high_value_only", "portrait_high_value"],
+        index=0,
+        help="Use 'portrait_only' to bias towards clear portraits; "
+             "'high_value_only' for masterpieces.",
+    )
+
     st.markdown('<div class="right-col">', unsafe_allow_html=True)
     st.markdown('<div class="art-wrap">', unsafe_allow_html=True)
 
@@ -576,7 +622,11 @@ with right:
 
             files = {"image": ("frame.jpg", buf.getvalue(), "image/jpeg")}
             # Ask backend for Top-10, we'll do diversity selection here
-            data = {"museum": "mixed", "topk": TAIL_TOP_K}
+            data = {
+                "museum": "mixed",
+                "topk": TAIL_TOP_K,
+                "mode": match_mode,
+            }
 
             try:
                 resp = requests.post(API_URL, files=files, data=data, timeout=30)
@@ -602,12 +652,17 @@ with right:
 
                 # ---------- diversity + mild randomness ----------
                 # Decide whether to start looking from the tail (ranks 4–10)
-                use_tail_first = random.random() < TAIL_RANDOM_PROB and len(results) > PRIMARY_TOP_K
+                use_tail_first = (
+                    random.random() < TAIL_RANDOM_PROB
+                    and len(results) > PRIMARY_TOP_K
+                )
                 primary_slice = results[:PRIMARY_TOP_K]
                 tail_slice = results[PRIMARY_TOP_K:TAIL_TOP_K]
 
                 ordered_candidates = (
-                    (tail_slice + primary_slice) if use_tail_first else (primary_slice + tail_slice)
+                    (tail_slice + primary_slice)
+                    if use_tail_first
+                    else (primary_slice + tail_slice)
                 )
 
                 chosen = None
@@ -668,7 +723,9 @@ with right:
 
                         painted = overlay_right_labels(painting, meta)
                         metrics = st.session_state.get("last_metrics") or []
-                        painted = draw_tiny_metrics_top_right(painted, metrics, size=16, margin=12)
+                        painted = draw_tiny_metrics_top_right(
+                            painted, metrics, size=16, margin=12
+                        )
 
                         w = min(RIGHT_IMG_MAXW, painted.width)
                         caption = f"{meta_row.get('title','')} — {meta.get('artist','')}"
