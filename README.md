@@ -224,6 +224,21 @@ EmbodiedAestheticReconstruction/
 └── .gitignore                          ✅ 忽略文件
 
 
+
+
+backend/
+   main.py              ← 我给你的 hybrid 版
+   config.py
+   model/
+      pose_matcher.py  ← 昨天给你的 hybrid matcher
+      utils.py
+   utils_pose.py       ← 新增（统一 keypoints→vector）
+   tools/
+      build_embeddings.py
+      build_pose_embeddings.py
+      build_mixed_index.py
+
+
 重新启动后端
 
 uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
