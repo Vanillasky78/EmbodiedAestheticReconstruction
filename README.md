@@ -239,6 +239,26 @@ backend/
       build_mixed_index.py
 
 
+
+
+Camera frame
+ → YOLOv8-Pose → 17 keypoints
+ → encode_keypoints_to_pose_vector -> q_pose
+
+Artwork image
+ → YOLOv8-Pose → 17 keypoints
+ → encode_keypoints_to_pose_vector → pose_embeddings.npy
+
+CLIP embedding (query)
+CLIP embedding (art)
+
+Hybrid matching:
+    base = (1-w)*clip_sim + w*pose_sim
+    final = base * (1 + metadata_bonus)
+
+
+
+
 重新启动后端
 
 uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
