@@ -24,21 +24,33 @@ Scoring:
 
 Filtering modes (optional):
 
-    mode="default"               → no hard filter, only soft bonus
-    mode="portrait_only"         → keep portrait_flag == 1
-    mode="high_value_only"       → keep value_score >= high_value_threshold
-    mode="portrait_high_value"   → both portrait & high value
+    mode="default"            → no hard filter, only soft bonus
+    mode="portrait_only"      → keep portrait_flag == 1
+    mode="high_value_only"    → keep value_score >= high_value_threshold
+    mode="portrait_high_value"→ both portrait & high value
 """
 
 from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 
-from .utils import normalize_rows  # already defined in utils.py
+
+# ------------------------------------------------------------------ #
+# Local helper: normalize rows (so we don't depend on utils.py)
+# ------------------------------------------------------------------ #
+def normalize_rows(x: np.ndarray) -> np.ndarray:
+    """
+    L2-normalize each row of a 2D array.
+
+    x: np.ndarray of shape (N, D)
+    returns: np.ndarray of shape (N, D) with unit-length rows.
+    """
+    n = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+    return x / n
 
 
 class PoseMatcher:
@@ -51,11 +63,11 @@ class PoseMatcher:
         museum_dir: Path,
         pose_weight: float = 0.35,
         topk_default: int = 3,
-        alpha_value: float = 0.40,          # weight for value_score
-        beta_portrait: float = 0.35,        # weight for portrait_flag
-        gamma_master: float = 0.25,         # weight for masterpiece_flag
-        delta_tier: float = 0.15,           # weight for tier_score
-        high_value_threshold: float = 0.60, # threshold for "high value"
+        alpha_value: float = 0.40,      # weight for value_score
+        beta_portrait: float = 0.35,    # weight for portrait_flag
+        gamma_master: float = 0.25,     # weight for masterpiece_flag
+        delta_tier: float = 0.15,       # weight for tier_score
+        high_value_threshold: float = 0.60,  # threshold for "high value"
     ):
         self.museum_dir = museum_dir
         self.pose_weight = float(pose_weight)
@@ -74,37 +86,35 @@ class PoseMatcher:
         if not emb_path.exists():
             raise FileNotFoundError(f"Missing embeddings: {emb_path}")
 
-        # ---- load CLIP embeddings ----
+        # ---- load CLIP embeddings
         self.clip_emb = np.load(emb_path).astype("float32")
         self.clip_emb = normalize_rows(self.clip_emb)
 
-        # ---- load metadata ----
+        # ---- load metadata
         self.meta: List[Dict] = self._load_meta_rows(meta_path)
 
-        # ---- load pose embeddings (optional) ----
+        # ---- load pose embeddings (optional)
         if pose_path.exists():
             print(f"[INFO] Pose embeddings found at {pose_path}")
             self.pose_emb = np.load(pose_path).astype("float32")
             self.pose_emb = normalize_rows(self.pose_emb)
             self.has_pose = True
         else:
-            print(f"[INFO] pose_embeddings.npy not found → CLIP-only mode")
+            print(f"[INFO] No pose_embeddings.npy → CLIP-only mode")
             self.pose_emb = None
             self.has_pose = False
 
-        # ---- sanity checks ----
+        # ---- sanity checks
         if len(self.meta) != len(self.clip_emb):
             raise ValueError(
-                f"Metadata length {len(self.meta)} != "
-                f"CLIP embeddings length {len(self.clip_emb)}"
+                f"Metadata length {len(self.meta)} != CLIP embeddings length {len(self.clip_emb)}"
             )
         if self.has_pose and len(self.pose_emb) != len(self.clip_emb):
             raise ValueError(
-                f"Pose embeddings length {len(self.pose_emb)} != "
-                f"CLIP embeddings length {len(self.clip_emb)}"
+                f"Pose embeddings length {len(self.pose_emb)} != CLIP embeddings length {len(self.clip_emb)}"
             )
 
-        # ---- build metadata priors as numpy arrays ----
+        # ---- pre-compute metadata priors as numpy arrays
         (
             self.value_scores,
             self.portrait_flags,
@@ -117,9 +127,9 @@ class PoseMatcher:
             f"→ N={len(self.clip_emb)}, pose={self.has_pose}"
         )
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     # Loading / preprocessing
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
     def _load_meta_rows(self, path: Path) -> List[Dict]:
         if not path.exists():
@@ -155,7 +165,7 @@ class PoseMatcher:
 
     def _build_meta_arrays(
         self, rows: List[Dict]
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Build dense numpy arrays for metadata priors:
           value_scores      ∈ [0,1]
@@ -164,10 +174,10 @@ class PoseMatcher:
           tier_scores       ∈ [0,1]
         """
 
-        value_scores: List[float] = []
-        portrait_flags: List[float] = []
-        masterpiece_flags: List[float] = []
-        tier_scores: List[float] = []
+        value_scores = []
+        portrait_flags = []
+        masterpiece_flags = []
+        tier_scores = []
 
         for r in rows:
             # value_score or fallback to some alternative field
@@ -207,9 +217,9 @@ class PoseMatcher:
             np.array(tier_scores, dtype="float32"),
         )
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     # Query encoders (you can keep using your existing CLIP / pose code)
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
     def encode_query_image(self, pil, clip_model, preprocess, device):
         """
@@ -241,16 +251,16 @@ class PoseMatcher:
         v = normalize_rows(v)
         return v  # (1, D_pose)
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     # Core matching
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
     def match(
         self,
-        clip_query_vec: np.ndarray,                  # shape (1, D_clip)
-        pose_query_vec: Optional[np.ndarray] = None, # shape (1, D_pose) or None
+        clip_query_vec: np.ndarray,             # shape (1, D_clip)
+        pose_query_vec: Optional[np.ndarray] = None,  # shape (1, D_pose) or None
         topk: Optional[int] = None,
-        mode: str = "default",                       # "default", "portrait_only", ...
+        mode: str = "default",                 # "default", "portrait_only", ...
     ) -> List[Dict]:
         """
         Return top-k matches with hybrid similarity & metadata priors.
