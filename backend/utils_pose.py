@@ -1,69 +1,108 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-utils_pose.py
--------------
-Unified utilities to convert YOLOv8-Pose keypoints → pose embedding vectors.
+utils_pose.py — safe pose encoder
+---------------------------------
 
-This MUST match build_pose_embeddings.py so that query vectors
-are compatible with stored pose_embeddings.npy.
+Convert YOLO keypoints → 1D pose feature vector.
+Handles:
+  - missing keypoints
+  - confidence arrays missing
+  - zero-length keypoints (no detection)
 """
 
 import numpy as np
 
 
-def encode_keypoints_to_pose_vector(
-    keypoints_xy: np.ndarray,   # shape: (17, 2)
-    visibility: np.ndarray,     # shape: (17,)
-) -> np.ndarray:
+def encode_keypoints_to_pose_vector(xy_norm, conf):
     """
-    Convert YOLOv8 keypoints → a normalized pose embedding vector.
+    Convert YOLO keypoints (xy_norm, conf) → a fixed-length 1D pose vector.
 
-    Steps:
-      1. Normalize XY to [0,1] by image width/height (caller must pre-normalize)
-      2. Use visibility as mask
-      3. Compute limb angles
-      4. Flatten into 1D feature vector
+    Parameters
+    ----------
+    xy_norm : np.ndarray (N, 2)
+        Normalized XY coordinates in [0,1].
+    conf : np.ndarray (N,)
+        Visibility/confidence for each keypoint.
+
+    Returns
+    -------
+    vec : np.ndarray or None
+        1D pose feature vector (55 dims). None if invalid.
     """
 
-    # ----- 1) Normalize XY (expected by build_pose_embeddings)
-    xy = keypoints_xy.astype("float32")
-    vis = visibility.astype("float32")
+    # -------- Safety: YOLO returned 0 keypoints --------
+    if xy_norm is None or len(xy_norm) == 0:
+        return None
+    if conf is None or len(conf) == 0:
+        return None
 
-    # Flatten XY
-    xy_flat = xy.reshape(-1)  # (34,)
+    # Expected 17 keypoints (COCO format)
+    N = xy_norm.shape[0]
+    if N < 5:
+        # too few keypoints → useless for pose embedding
+        return None
 
-    # ----- 2) visibility mask
-    mask = vis.reshape(-1)  # (17,)
+    # Build dict: k[i] = (x,y) or None
+    k = {}
+    vis = conf
+    for i in range(N):
+        if vis[i] > 0.1:
+            k[i] = xy_norm[i]
+        else:
+            k[i] = None
 
-    # ----- 3) Compute simple limb angles
+    # -------- Feature extraction examples --------
     def angle(p1, p2):
         if p1 is None or p2 is None:
             return 0.0
-        vx, vy = p2[0] - p1[0], p2[1] - p1[1]
-        return np.degrees(np.arctan2(vy, vx))
+        v = p2 - p1
+        return float(np.degrees(np.arctan2(v[1], v[0])))
 
-    # Example pairs (shoulder-left → elbow-left, etc.)
-    k = xy
-    angle_pairs = [
+    def dist(p1, p2):
+        if p1 is None or p2 is None:
+            return 0.0
+        return float(np.linalg.norm(p2 - p1))
+
+    # Example 55-dim handmade embedding
+    feats = []
+
+    # Angles between some key joints
+    pairs = [
+        (1, 2),
+        (5, 6),
+        (11, 12),
+        (7, 8),
+    ]
+
+    for a, b in pairs:
+        if a < N and b < N:
+            feats.append(angle(k[a], k[b]))
+        else:
+            feats.append(0.0)
+
+    # Distances between some parts
+    dist_pairs = [
         (5, 7),
         (7, 9),
         (6, 8),
         (8, 10),
     ]
-    angs = []
-    for a, b in angle_pairs:
-        p1 = k[a] if vis[a] > 0.1 else None
-        p2 = k[b] if vis[b] > 0.1 else None
-        angs.append(angle(p1, p2))
-    angs = np.array(angs, dtype="float32")  # (4,)
 
-    # ----- 4) Concatenate all
-    feat = np.concatenate([
-        xy_flat,      # 34
-        mask,         # 17
-        angs,         # 4
-    ]).astype("float32")  # total = 34+17+4 = 55 dims
+    for a, b in dist_pairs:
+        if a < N and b < N:
+            feats.append(dist(k[a], k[b]))
+        else:
+            feats.append(0.0)
 
-    return feat  # (55,)
+    # Append raw XY for all available keypoints (flattened)
+    for i in range(min(N, 17)):
+        p = k[i]
+        if p is None:
+            feats.extend([0.0, 0.0])
+        else:
+            feats.extend([float(p[0]), float(p[1])])
+
+    # Pad to 55 dims
+    while len(feats) < 55:
+        feats.append(0.0)
+
+    return np.array(feats, dtype="float32")
