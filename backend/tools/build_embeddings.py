@@ -1,200 +1,281 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-build_pose_embeddings.py
--------------------------
-Generate pose-based embeddings for all artworks using YOLOv8-Pose.
+build_embeddings.py
+-----------------------
 
-Output:
-    data/mixed/pose_embeddings.npy
-    (same row ordering as embeddings_meta.csv)
+Build CLIP-style image embeddings for a single museum folder.
 
-Usage:
-    conda activate ear-mvp
-    python backend/tools/build_pose_embeddings.py --data-root data/mixed
+Expected layout per museum:
+
+  data/<museum>/
+    images/
+      *.jpg / *.png ...
+    embeddings_meta.csv      # must contain at least a 'filename' column
+
+Output per museum:
+
+  data/<museum>/embeddings.npy     # (N, D) CLIP image embeddings
+
+Typical workflow
+----------------
+
+# 1. Prepare per-museum metadata (already done in your project)
+#    data/local/embeddings_meta.csv
+#    data/met/embeddings_meta.csv
+#    data/aic/embeddings_meta.csv
+#
+# 2. Build embeddings for each museum:
+#
+#    python backend/tools/build_embeddings.py --museum local --data_root data
+#    python backend/tools/build_embeddings.py --museum met   --data_root data
+#    python backend/tools/build_embeddings.py --museum aic   --data_root data
+#
+# 3. Merge them into data/mixed/ with:
+#
+#    python backend/tools/build_mixed_index.py --museums local met aic --data_root data --out_museum mixed
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Optional, List
+
 import numpy as np
+import pandas as pd
 from PIL import Image
-import json
 from tqdm import tqdm
 
-# YOLOv8-Pose
-try:
-    from ultralytics import YOLO
-except Exception as exc:
-    raise RuntimeError("Ultralytics YOLO is required. `pip install ultralytics`.") from exc
+import torch
+import open_clip
 
 
-# -------------------------
-# Pose vector utilities
-# -------------------------
+# ----------------------------------------------------------
+# Utilities
+# ----------------------------------------------------------
 
-def encode_pose_keypoints(kps: np.ndarray | None, img_w: int, img_h: int) -> np.ndarray:
+
+def detect_device(device_override: Optional[str] = None) -> torch.device:
     """
-    Convert raw keypoints (N x 3: x,y,confidence) into a fixed pose vector.
-
-    We encode:
-      - normalized coordinates (x/img_w, y/img_h)
-      - per-joint existence mask
-      - joint angle features
+    Auto-detect CUDA / MPS / CPU, with optional manual override.
     """
+    if device_override:
+        return torch.device(device_override)
 
-    num_joints = 17  # YOLOv8 Pose has 17 keypoints (0..16)
-    if kps is None:
-        # No detection → zero vector
-        return np.zeros(num_joints * 4, dtype=np.float32)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
 
-    # If YOLO returns more than one person, we take the one with largest area
-    # but build_embeddings will only run on artwork images (static), so 1 person is expected.
-    if len(kps.shape) == 3:  # shape [num_people, 17, 3]
-        kps = kps[0]
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
 
-    # Prepare vector components
-    coord_vec = np.zeros((num_joints, 2), dtype=np.float32)
-    mask_vec  = np.zeros((num_joints, 1), dtype=np.float32)
-    angle_vec = np.zeros((num_joints, 1), dtype=np.float32)
-
-    # Normalize
-    for i in range(num_joints):
-        x, y, conf = kps[i]
-        if conf > 0.1:
-            coord_vec[i] = np.array([x / img_w, y / img_h])
-            mask_vec[i] = 1.0
-        else:
-            coord_vec[i] = 0.0
-            mask_vec[i] = 0.0
-
-    # Compute simple limb angles (example: shoulders/elbows/wrists)
-    # We encode angle at elbow and knee joints for stability
-    def safe_angle(a, b, c):
-        """Return angle ABC in radians."""
-        if (a is None) or (b is None) or (c is None):
-            return 0.0
-        ax, ay = a
-        bx, by = b
-        cx, cy = c
-        v1 = np.array([ax - bx, ay - by])
-        v2 = np.array([cx - bx, cy - by])
-        n1 = np.linalg.norm(v1)
-        n2 = np.linalg.norm(v2)
-        if n1 < 1e-6 or n2 < 1e-6:
-            return 0.0
-        cosv = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
-        return float(np.arccos(cosv))  # radians
-
-    # Joint indices follow COCO:
-    # 5: left shoulder, 6: right shoulder
-    # 7: left elbow,    8: right elbow
-    # 9: left wrist,   10: right wrist
-    # 11: left hip,    12: right hip
-    # 13: left knee,   14: right knee
-    # 15: left ankle,  16: right ankle
-
-    joints = kps[:, :2]
-    def jp(idx):
-        x, y, conf = kps[idx]
-        return (x, y) if conf > 0.1 else None
-
-    # elbow angles
-    angle_vec[7]  = safe_angle(jp(5), jp(7), jp(9))
-    angle_vec[8]  = safe_angle(jp(6), jp(8), jp(10))
-
-    # knee angles
-    angle_vec[13] = safe_angle(jp(11), jp(13), jp(15))
-    angle_vec[14] = safe_angle(jp(12), jp(14), jp(16))
-
-    # Flatten
-    return np.concatenate([
-        coord_vec.reshape(-1),
-        mask_vec.reshape(-1),
-        angle_vec.reshape(-1),
-    ]).astype(np.float32)
+    return torch.device("cpu")
 
 
-# -------------------------
-# Main build function
-# -------------------------
+def load_clip_model(
+    model_name: str,
+    pretrained: str,
+    device: torch.device,
+):
+    """
+    Load an OpenCLIP image encoder and its preprocessing transform.
+    """
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        model_name,
+        pretrained=pretrained,
+        device=device,
+    )
+    model.eval()
+    return model, preprocess
 
-def build_pose_embeddings(data_root: Path, model_path: Path):
-    meta_path = data_root / "embeddings_meta.csv"
-    images_dir = data_root / "images"
 
-    if not meta_path.exists():
-        raise FileNotFoundError(f"Missing: {meta_path}")
+def normalize_rows(x: np.ndarray) -> np.ndarray:
+    """
+    L2-normalize each row of a 2D array.
+    """
+    n = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+    return x / n
 
-    # Load metadata rows in order
-    import csv
-    with open(meta_path, "r", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
 
-    print(f"[INFO] Loaded {len(rows)} metadata rows.")
+def resolve_filename(row: pd.Series) -> Optional[str]:
+    """
+    Try to resolve an image filename from a metadata row.
 
-    # Init YOLO pose model
-    print(f"[INFO] Loading YOLOv8-Pose: {model_path}")
-    model = YOLO(str(model_path))
+    We primarily look for a 'filename' column, but fall back to
+    common alternatives just in case.
+    """
+    for col in ["filename", "file", "image_path", "path"]:
+        if col in row and isinstance(row[col], str) and row[col].strip():
+            return row[col].strip()
+    return None
 
-    pose_vectors = []
 
-    for row in tqdm(rows, desc="Building pose vectors"):
-        fname = (
-            row.get("filename")
-            or row.get("image_path")
-            or row.get("path")
-            or row.get("file")
+# ----------------------------------------------------------
+# Core logic
+# ----------------------------------------------------------
+
+
+def build_for_museum(
+    museum: str,
+    data_root: str = "data",
+    model_name: str = "ViT-B-32",
+    pretrained: str = "openai",
+    device: Optional[str] = None,
+) -> None:
+    """
+    Build CLIP image embeddings for one museum.
+
+    The function will:
+
+    1. Read data/<museum>/embeddings_meta.csv
+    2. For each row, resolve a filename and open the image from data/<museum>/images/
+    3. Encode it with CLIP and collect a (N, D) embedding matrix
+    4. Save it as data/<museum>/embeddings.npy
+    """
+    base = Path(data_root) / museum
+    img_dir = base / "images"
+    meta_path = base / "embeddings_meta.csv"
+    out_path = base / "embeddings.npy"
+
+    # --- sanity checks -------------------------------------------------
+    if not img_dir.is_dir():
+        print(f"[ERROR] images folder not found: {img_dir}")
+        return
+
+    if not meta_path.is_file():
+        print(f"[ERROR] embeddings_meta.csv not found: {meta_path}")
+        return
+
+    df = pd.read_csv(meta_path)
+    if df.empty:
+        print(f"[WARN] no rows found in meta file: {meta_path}")
+        return
+
+    # Try to ensure there is at least some filename-like column
+    if not any(col in df.columns for col in ["filename", "file", "image_path", "path"]):
+        print(
+            f"[ERROR] no filename-like column found in {meta_path}. "
+            f"Expected at least one of: filename / file / image_path / path"
         )
+        return
+
+    dev = detect_device(device)
+    print("-" * 60)
+    print(f"[INFO] Building CLIP embeddings for museum='{museum}'")
+    print(f"[INFO] data_root   = {data_root}")
+    print(f"[INFO] images_dir  = {img_dir}")
+    print(f"[INFO] meta_csv    = {meta_path}")
+    print(f"[INFO] rows in meta= {len(df)}")
+    print(f"[INFO] device      = {dev}")
+    print(f"[INFO] model       = {model_name} ({pretrained})")
+
+    model, preprocess = load_clip_model(model_name, pretrained, dev)
+
+    feats: List[np.ndarray] = []
+    kept = 0
+    skipped_missing = 0
+    skipped_error = 0
+
+    for _, row in tqdm(df.iterrows(), total=len(df), desc=museum):
+        fname = resolve_filename(row)
         if not fname:
-            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
+            skipped_missing += 1
             continue
 
-        img_path = images_dir / fname
-        if not img_path.exists():
-            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
+        img_path = img_dir / fname
+        if not img_path.is_file():
+            print(f"[WARN] missing image file: {img_path}")
+            skipped_missing += 1
             continue
 
         try:
-            img = Image.open(img_path).convert("RGB")
-        except Exception:
-            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
+            pil = Image.open(img_path).convert("RGB")
+        except Exception as e:
+            print(f"[WARN] failed to open {img_path}: {e}")
+            skipped_error += 1
             continue
 
-        w, h = img.size
-        img_np = np.array(img)
+        tensor = preprocess(pil).unsqueeze(0).to(dev)
 
-        # YOLO pose inference
-        res = model.predict(img_np, imgsz=640, device="cpu", verbose=False)
-        if len(res) == 0 or res[0].keypoints is None:
-            pose_vectors.append(np.zeros(17 * 4, dtype=np.float32))
-            continue
+        # autocast is safe for cuda/mps and disabled for cpu
+        use_amp = dev.type in ("cuda", "mps")
+        with torch.no_grad(), torch.autocast(device_type=dev.type, enabled=use_amp):
+            feat = model.encode_image(tensor)
+            feat = feat.float().cpu().numpy()  # (1, D)
 
-        kps = res[0].keypoints.cpu().numpy()  # shape: [1, 17, 3]
-        vec = encode_pose_keypoints(kps, w, h)
-        pose_vectors.append(vec)
+        feats.append(feat)
+        kept += 1
 
-    pose_vectors = np.stack(pose_vectors, axis=0)
-    out_path = data_root / "pose_embeddings.npy"
+    if not feats:
+        print(f"[WARN] no features produced for museum='{museum}'")
+        return
 
-    np.save(out_path, pose_vectors)
-    print(f"[OK] Saved pose embeddings → {out_path}")
-    print(f"[INFO] shape = {pose_vectors.shape} (rows match embeddings_meta.csv)")
+    E = np.concatenate(feats, axis=0)  # (N, D)
+    E = normalize_rows(E)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(out_path, E)
+
+    print(f"[OK] museum='{museum}': embeddings shape={E.shape} → {out_path}")
+    print(
+        f"[INFO] stats: kept={kept}, "
+        f"missing_files={skipped_missing}, "
+        f"open_errors={skipped_error}"
+    )
+    print("-" * 60)
 
 
-# -------------------------
+# ----------------------------------------------------------
 # CLI
-# -------------------------
+# ----------------------------------------------------------
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", type=str, default="data/mixed",
-                        help="path to dataset folder that contains images/ and embeddings_meta.csv")
-    parser.add_argument("--yolo-model", type=str, default="frontend/yolov8n-pose.pt",
-                        help="path to YOLOv8-Pose .pt file")
 
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build CLIP image embeddings for one museum folder."
+    )
+    parser.add_argument(
+        "--museum",
+        type=str,
+        required=True,
+        help="Museum folder name under data/, e.g. local / met / aic / mixed",
+    )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default="data",
+        help="Root directory that contains museum folders (default: data)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="ViT-B-32",
+        help="CLIP model name (default: ViT-B-32)",
+    )
+    parser.add_argument(
+        "--pretrained",
+        type=str,
+        default="openai",
+        help="Pretrained tag for OpenCLIP (default: openai)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Optional torch device override, e.g. 'cuda', 'cpu', 'mps'",
+    )
     args = parser.parse_args()
 
-    build_pose_embeddings(
-        Path(args.data_root),
-        Path(args.yolo_model),
+    build_for_museum(
+        museum=args.museum,
+        data_root=args.data_root,
+        model_name=args.model,
+        pretrained=args.pretrained,
+        device=args.device,
     )
+
+
+if __name__ == "__main__":
+    main()
