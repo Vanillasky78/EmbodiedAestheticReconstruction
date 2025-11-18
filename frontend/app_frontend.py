@@ -54,6 +54,7 @@ RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
+# Stillness / motion parameters
 STILLNESS_SEC = 3.5
 MAX_BUF_SEC = 5.0
 FPS_ASSUMED = 12
@@ -61,6 +62,7 @@ MOTION_EPS_CXCY = 4.0
 MOTION_EPS_AREA = 0.03
 MIN_FACE_AREA = 0.06
 
+# Colors
 YELLOW = (255, 235, 59)
 BLACK = (0, 0, 0)
 HOT_PINK = (255, 30, 180)
