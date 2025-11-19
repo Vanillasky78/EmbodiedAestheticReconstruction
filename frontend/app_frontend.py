@@ -241,6 +241,60 @@ def format_metrics(kps: Dict[int, Tuple[float, float] | None]) -> List[str]:
     ]
 
 
+def _format_price(meta: Dict) -> str:
+    """
+    Return a human-readable price string.
+
+    Priority:
+      1) Use existing price_text / auction_price_usd / price if present.
+      2) Otherwise, generate a *large* deterministic pseudo-price from
+         year + filename, just for exhibition visuals (NOT real value).
+    """
+    raw = (
+        meta.get("price_text")
+        or meta.get("auction_price_usd")
+        or meta.get("price")
+    )
+
+    if raw is not None:
+        s = str(raw).strip()
+        if s and s not in {"—", "-", "None", "nan"}:
+            return s
+
+    # ---------- No real price in metadata → fabricate a big pseudo price ----------
+    # Year influence
+    year = None
+    try:
+        if meta.get("year"):
+            year = int(float(meta["year"]))
+    except Exception:
+        year = None
+
+    # Big base so prices all look like masterpieces
+    base = 2_000_000  # $2M baseline
+    if year:
+        # older → more expensive
+        base += max(0, year - 1400) * 5_000
+
+    # Filename hash for deterministic jitter
+    fname = (
+        meta.get("filename")
+        or meta.get("image_path")
+        or meta.get("path")
+        or ""
+    )
+    h = sum(ord(c) for c in str(fname)) % 20_000
+    price_val = base + h * 500  # add up to +10M
+
+    # Format into M / k
+    if price_val >= 100_000_000:
+        return f"${price_val / 1_000_000:.1f}M"
+    elif price_val >= 1_000_000:
+        return f"${price_val / 1_000_000:.2f}M"
+    else:
+        return f"${price_val / 1_000:.1f}k"
+
+
 def overlay_right_labels(painting: Image.Image, meta: Dict) -> Image.Image:
     """Yellow label stack: price, year, artist."""
     im = painting.convert("RGB").copy()
@@ -249,12 +303,7 @@ def overlay_right_labels(painting: Image.Image, meta: Dict) -> Image.Image:
     font_big = _load_font(44)
     font_small = _load_font(36)
 
-    price = (
-        meta.get("price_text")
-        or meta.get("auction_price_usd")
-        or meta.get("price")
-        or "—"
-    )
+    price = _format_price(meta)
     year = str(meta.get("year") or "—")
     artist = meta.get("artist") or "artist name"
 
@@ -721,6 +770,7 @@ with right:
                             "price_text": meta_row.get("price_text")
                             or meta_row.get("auction_price_usd")
                             or "",
+                            "filename": filename,
                         }
 
                         painted = overlay_right_labels(painting, meta)
