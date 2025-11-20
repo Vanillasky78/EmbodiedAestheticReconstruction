@@ -72,11 +72,11 @@ pip install -r backend/requirements.txt
 pip install -r frontend/requirements.txt
 
 ## 4. Running the System
-Start backend:
+1. Start backend:
 uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
-Start Frontend:
+2. Start Frontend:
 streamlit run frontend/app_frontend.py
-The app will open at:
+3. The app will open at:
 http://localhost:8501
 
 ## 5. How It Works
@@ -108,13 +108,13 @@ final_score = 0.65 * CLIP + 0.35 * Pose
    - Symmetric full-screen layout
 
 ## 6. Optional: Rebuild Indexes
-# Build CLIP embeddings
+1. Build CLIP embeddings
 python -m backend.tools.build_embeddings --museum_dir data/local
 
-# Build pose embeddings
+2. Build pose embeddings
 python -m backend.tools.build_pose_embeddings --museum_dir data/local --device cpu
 
-# Build mixed index
+3. Build mixed index
 python -m backend.tools.build_mixed_index
 
 ## 7. Data Requirements
@@ -173,7 +173,6 @@ data/mixed/
 └────────────────────────────┘
 
 ## 9. Outcome Demonstration
-# Final Video (Vimeo)
 https://vimeo.com/1138944508
 
 ## 10. Features
