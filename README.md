@@ -59,20 +59,24 @@ EmbodiedAestheticReconstruction/
 └── requirements.txt
 
 ## 3. Installation
-# Create environment
+# 1. Clone the repository
+git clone https://github.com/Vanillasky78/EmbodiedAestheticReconstruction.git
+cd EmbodiedAestheticReconstruction
+
+# 2. Create environment (Python 3.10 recommended)
 conda create -n ear-mvp python=3.10 -y
 conda activate ear-mvp
-# Install dependencies
-pip install -r requirements.txt
+
+# 3. Install backend + frontend dependencies
+pip install -r backend/requirements.txt
+pip install -r frontend/requirements.txt
 
 ## 4. Running the System
-# Start Backend
+Start backend:
 uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
-
-# Start Frontend
+Start Frontend:
 streamlit run frontend/app_frontend.py
-
-# The app will open at:
+The app will open at:
 http://localhost:8501
 
 ## 5. How It Works
