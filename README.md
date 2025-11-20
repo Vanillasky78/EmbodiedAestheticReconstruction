@@ -1,142 +1,131 @@
 # Embodied Aesthetic Reconstruction  
 *Final MSc Project — University of the Arts London (CCI)*  
 
-## 🌐 Overview  
-This project, **Embodied Aesthetic Reconstruction**, explores how **motion capture** and **generative AI** can be used to resist disciplinary norms of body aesthetics.  
-Instead of enforcing an “ideal body” shaped by algorithms, the system generates **playful, personalised artistic representations** that celebrate diverse embodiment.  
+## Project Statement  
+"Embodied Aesthetic Reconstruction Against Disciplinary Norms" is a research project on a personalised artistic image-generation system based on motion capture and generative AI, creating playful and artistic outputs that correspond to each individual’s body shape. 
+It aims to break the body anxiety caused by standardised and homogenised ideals of the “perfect body.” By using motion-capture technology to scan each person’s physical form, and an AI-driven image database to automatically match suitable artworks (or fashion silhouettes), the project highlights that every individual possesses their own complete aesthetic presence and value. What is considered perfect (a beautiful body) should inherently be diverse and unique.  
 
-## ✨ Features  
-- **Motion Capture Input** → extract pose landmarks (via MediaPipe).  
-- **Cross-modal Embeddings** → fuse pose with personality traits (Big Five sliders).  
-- **Generative Output**:  
-  - *Visual*: Stylised image output (Diffusion/Dreambooth can be integrated).  
-  - *Audio*: Soundscape generation (RAVE/AudioLM integration planned).  
-- **Ethics by Design**: consent gate, data retention toggle, bias awareness.  
+## 1. System Overview  
+This MVP implements a fully functional real-time pose-driven curatorial AI system combining:
 
-## 🚀 Installation  
-Clone the repository and set up environment:  
-```bash
-git clone https://github.com/Vanillasky78/EmbodiedAestheticReconstruction.git
-cd EmbodiedAestheticReconstruction
+• YOLOv8-Pose for live keypoint detection  
+• OpenCLIP (ViT-B/32) for image embeddings  
+• Hybrid similarity scoring  
+• Curated multi-museum image dataset  
+• Streamlit frontend + FastAPI backend  
+• Stillness-triggered auto-capture (3–5 seconds)  
+• Real-time artwork display with metadata (artist / year / value)  
+
+Pipeline:  
+Camera → Pose Estimation → Embedding Fusion → Artwork Matching → Curated Output
+
+## 2. Repository Structure
+EmbodiedAestheticReconstruction/
+│
+├── backend/                     # FastAPI backend engine
+│   ├── main.py                  # API entrypoint
+│   ├── config.py
+│   ├── utils_pose.py            # Keypoint → vector encoder
+│   ├── model/
+│   │   ├── pose_matcher.py      # Hybrid pose + CLIP matcher
+│   │   ├── utils.py
+│   │   └── yolov8n-pose.pt
+│   └── tools/
+│       ├── build_embeddings.py
+│       ├── build_pose_embeddings.py
+│       └── build_mixed_index.py
+│
+├── frontend/                    # Streamlit UI
+│   ├── app_frontend.py
+│   ├── app_curatorial.py
+│   └── yolov8n-pose.pt
+│
+├── data/                        # Art datasets (local + MET + AIC)
+│   ├── mixed/
+│   │   ├── images/
+│   │   ├── embeddings.npy
+│   │   ├── pose_embeddings.npy
+│   │   └── embeddings_meta.csv
+│   ├── local/
+│   ├── met/
+│   └── aic/
+│
+├── scripts/
+│   ├── setup_check.py
+│   ├── start_local.sh
+│   └── start_local.bat
+│
+├── README.md
+└── requirements.txt
+
+## 3. Installation
+# Create environment
 conda create -n ear-mvp python=3.10 -y
 conda activate ear-mvp
+# Install dependencies
 pip install -r requirements.txt
 
-streamlit run app.py
+## 4. Running the System
+# Start Backend
+uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
 
-embodied-aesthetic-reconstruction/
-├── app.py                  # Streamlit entrypoint
-├── core/                   # Pose, personalisation, style selection, image ops
-├── audio/                  # Embedding → audio synthesis
-├── ui/                     # Streamlit UI components
-├── ethics/                 # Consent text & ethics logic
-├── tests/                  # Unit tests
-├── outputs/                # Generated media (gitignored)
-├── requirements.txt        # Dependencies
-└── README.md               # Project description
+# Start Frontend
+streamlit run frontend/app_frontend.py
 
-
-cd ~/Documents/GitHub/EmbodiedAestheticReconstruction
-conda env create -f environment.yml
-conda activate ear-mvp
-streamlit run app.py
-------
-conda activate ear-mvp
-cd ~/Documents/GitHub/EmbodiedAestheticReconstruction
-streamlit run app.py
-
-------
-# Embodied Aesthetic Reconstruction (macOS M4 Pro Setup)
-
-An interactive AI system that matches human body poses to curated portrait artworks via **CLIP + Pose + Color fusion**.  
-This guide explains how to install and run the project smoothly on Apple Silicon (M-series) macOS.
-
----
-
-## 🧩 1. Environment Setup (Miniforge + Conda + MPS)
-
-> Tested on macOS Sequoia 15.7 / Apple M4 Pro / Python 3.10 + PyTorch 2.2 MPS
-
-### 1.1 Install Miniforge (or Miniconda for Apple Silicon)
-Download and run:
-
-```bash
-/bin/bash -c "$(curl -fsSL https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh)"
-
-Restart your terminal after installation.
-1.2 Create and activate environment
-Inside your project folder:
-cd ~/Documents/GitHub/EmbodiedAestheticReconstruction
-conda create -n ear-mvp python=3.10 -y
-conda activate ear-mvp
-1.3 Install dependencies
-Use either the YAML file or the requirements.txt:
-conda env update -f environment.yml
-# or
-pip install -r requirements.txt
-Confirm installation and device support:
-python -m torch.utils.collect_env
-You should see MPS available: True.
-
-🚀 2. Run the App
-conda activate ear-mvp
-cd ~/Documents/GitHub/EmbodiedAestheticReconstruction
-streamlit run app.py
-Then open the auto-generated local URL, usually:
+# The app will open at:
 http://localhost:8501
-You’ll see:
-Left sidebar: weight sliders, filters, and device status
-Main area: camera capture or image upload interface
-Results: Top-K portrait matches with metadata and scores
-🖼️ 3. Dataset Preparation
-Your project expects:
-data/
-├── images/                  ← portrait images (.jpg or .png)
-├── interim/                 ← camera captures (autogenerated)
-├── portrait_works.csv       ← metadata (title / artist / year / license)
-⚠️ Important for iCloud Users
-If your data/images folder is synced via iCloud, some files may appear as:
-DaVinci_Ginevra.jpg.icloud
-Those are not downloaded yet.
-In Finder:
-right-click data/images → Download Now
-All images must be fully local before running the app.
-🧠 4. Main Features
-CLIP image embeddings ( open_clip_torch ViT-B-32 )
-YOLOv8n-Pose via ultralytics (works on MPS)
-Color histogram features (HSV fusion)
-Adjustable weights for CLIP / Pose / Color
-Public-Domain filter (based on license field in CSV)
-Automatic embedding cache in .clip_cache/
-⚙️ 5. Troubleshooting Guide
-❌ “Invalid CUDA device '0'”
-Apple Silicon does not support CUDA.
-Fixed in this version (yolo_device() maps to MPS).
-If you still see it, re-run after saving app.py.
-❌ “Search failed: Error opening data/images”
-The folder exists but contains .icloud files.
-Right-click → Download Now, then reload Streamlit.
-❌ “No pose feature detected”
-Pose estimation runs best in well-lit images with visible upper body.
-Try raising the Pose weight slider to 0.3 and Color weight to 0.2.
-📸 Camera Access
-If Streamlit cannot access your camera:
-System Settings → Privacy & Security → Camera → allow Terminal.app
-📦 6. Development Tips
-Task	Command
-Update env	conda env update -f environment.yml --prune
-Clear cache	rm -rf .clip_cache
-Rebuild embeddings	Delete .clip_cache → restart app
-Export requirements	pip freeze > requirements.txt
-🧑‍🎨 7. Credits
-Author: Xinyi Zhang
-Project: Embodied Aesthetic Reconstruction
-Institute: UAL – Creative Computing Institute (MSc Computing and Creative Industry)
-Enjoy exploring your embodied-AI portrait system on macOS 💫
 
+## 5. How It Works
+1. Motion Capture  
+   YOLOv8-Pose extracts 17 keypoints from camera input in real time.
 
-EAR System Architecture Diagram (Text Layout)
+2. Stillness Detection  
+   A 3–5 second stability window auto-triggers the capture.
 
+3. Embedding Fusion  
+   • CLIP embedding → semantic meaning  
+   • Pose embedding → structural geometry  
+
+4. Database Matching  
+   Each artwork includes:  
+   - CLIP embedding  
+   - Pose embedding  
+   - Metadata (artist, title, year)  
+   - Optional price estimation  
+
+5. Hybrid Similarity  
+
+final_score = 0.65 * CLIP + 0.35 * Pose
+
+6. Output  
+   The matched artwork appears on the right panel with:  
+   - Yellow label (value, year, artist)  
+   - Pose overlay  
+   - Symmetric full-screen layout
+
+## 6. Optional: Rebuild Indexes
+# Build CLIP embeddings
+python -m backend.tools.build_embeddings --museum_dir data/local
+
+# Build pose embeddings
+python -m backend.tools.build_pose_embeddings --museum_dir data/local --device cpu
+
+# Build mixed index
+python -m backend.tools.build_mixed_index
+
+## 7. Data Requirements
+Each dataset folder (local / met / aic) must contain:
+
+data/<museum>/
+│   images/
+│   embeddings.npy
+│   pose_embeddings.npy
+│   embeddings_meta.csv
+
+The system defaults to:
+data/mixed/
+
+## 8. System Architecture (Text Diagram)
 ┌────────────────────────────┐
 │        👩 Audience          │
 │  Moves or stands in front  │
@@ -146,124 +135,53 @@ EAR System Architecture Diagram (Text Layout)
                ▼
 ┌────────────────────────────┐
 │   🎨 Streamlit Frontend (UI)
-│  -----------------------------
 │  1️⃣ Captures camera input
-│  2️⃣ Detects stillness (optional)
-│  3️⃣ Sends captured image to API
-│  4️⃣ Displays matched artworks
+│  2️⃣ Detects stillness
+│  3️⃣ Sends image to API
+│  4️⃣ Displays matched artwork
 │
 │  Modes:
-│   • Local (runs PoseMatcher directly)
-│   • Remote (calls FastAPI backend)
+│   • Local (PoseMatcher)
+│   • Remote (FastAPI)
 └──────────────┬─────────────┘
                │
                ▼
 ┌────────────────────────────┐
-│   ⚙️ FastAPI Backend (Engine)
-│  -----------------------------
-│  Receives image → runs matching:
-│   1️⃣ YOLOv8-Pose (keypoints)
-│   2️⃣ OpenCLIP (embeddings)
-│   3️⃣ Cosine similarity vs database
-│  Returns JSON results to frontend
+│   ⚙️ FastAPI Backend
+│  Receives image → matching:
+│   1️⃣ YOLOv8-Pose
+│   2️⃣ OpenCLIP
+│   3️⃣ Hybrid similarity
 │
-│  API endpoints:
+│  Endpoints:
 │   - /match
 │   - /list_museums
-│   - /metadata/{museum}/{filename}
-│   - /status
+│   - /metadata/{museum}/{file}
 └──────────────┬─────────────┘
                │
                ▼
 ┌────────────────────────────┐
-│   🗂️ Data Layer (Artworks DB)
-│  -----------------------------
-│  - data/local/images/ (artwork images)
-│  - data/local/embeddings.npy
-│  - data/local/embeddings_meta.csv
-│  - metadata: artist, title, year, etc.
+│   🗂️ Data Layer
+│  - images/
+│  - embeddings.npy
+│  - pose_embeddings.npy
+│  - embeddings_meta.csv
 └────────────────────────────┘
 
-EmbodiedAestheticReconstruction/
-│
-├── backend/                           ✅ FastAPI 后端
-│   ├── __init__.py
-│   ├── main.py                         ✅ 主入口（启动 FastAPI）
-│   ├── config.py                       ✅ 全局配置
-│   ├── requirements.txt
-│   ├── model/                          ✅ 核心算法（姿态匹配）
-│   │   ├── __init__.py
-│   │   ├── pose_matcher.py
-│   │   ├── utils.py
-│   │   └── yolov8n-pose.pt
-│   └── tools/                          ✅ 工具脚本
-│       ├── build_embeddings.py
-│       └── （其他辅助脚本）
-│
-├── data/
-│   ├── local/                          ✅ 当前使用的 museum 数据源
-│   │   ├── images/                     ✅ 作品图片（16张）
-│   │   ├── embeddings.npy              ✅ 向量文件（勿删）
-│   │   ├── embeddings_meta.csv         ✅ 自动生成的索引（勿删）
-│   │   └── portrait_works.csv          ✅ 你手动编辑的元数据（主文件）
-│   └── （可选其他 museum，如 met/ tate）
-│
-├── frontend/                           ✅ Streamlit 前端
-│   ├── app_frontend.py                 ✅ 主界面
-│   ├── app_curatorial.py               （可保留备用）
-│   ├── requirements.txt
-│   └── .streamlit/                     ✅ 配置文件（可选）
-│
-├── scripts/                            ✅ 环境与检测工具
-│   ├── setup_check.py
-│   ├── start_local.sh                  ✅ 可选一键启动脚本（Mac）
-│   └── start_local.bat                 ✅ 可选一键启动脚本（Windows）
-│
-├── README.md                           ✅ 工程说明
-├── environment.yml                     ✅ Conda 环境配置
-└── .gitignore                          ✅ 忽略文件
+## 9. Outcome Demonstration
+# Final Video (Vimeo)
+https://vimeo.com/1138944508
 
+## 10. Features
+- **Motion Capture Input** → extract pose landmarks (via MediaPipe).
+- **Cross-modal Embeddings** → fuse pose with personality traits (Big Five sliders).
+- **Generative Output**:
+  - *Visual*: Stylised image output (Diffusion/Dreambooth optional).
+  - *Audio*: Soundscape generation (RAVE/AudioLM integration planned).
+- **Ethics by Design**: consent gate, data retention toggle, bias awareness.
 
-
-
-backend/
-   main.py              ← 我给你的 hybrid 版
-   config.py
-   model/
-      pose_matcher.py  ← 昨天给你的 hybrid matcher
-      utils.py
-   utils_pose.py       ← 新增（统一 keypoints→vector）
-   tools/
-      build_embeddings.py
-      build_pose_embeddings.py
-      build_mixed_index.py
-
-
-
-
-Camera frame
- → YOLOv8-Pose → 17 keypoints
- → encode_keypoints_to_pose_vector -> q_pose
-
-Artwork image
- → YOLOv8-Pose → 17 keypoints
- → encode_keypoints_to_pose_vector → pose_embeddings.npy
-
-CLIP embedding (query)
-CLIP embedding (art)
-
-Hybrid matching:
-    base = (1-w)*clip_sim + w*pose_sim
-    final = base * (1 + metadata_bonus)
-
-
-
-
-重新启动后端
-
-uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
-
-
-启动前端
-
-streamlit run frontend/app_frontend.py
+## 11. Credit
+Author: Xinyi Zhang  
+Programme: MSc Computing and Creative Industry  
+Institute: UAL – Creative Computing Institute  
+Year: 2025  
