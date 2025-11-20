@@ -229,13 +229,6 @@ data/mixed/
 
 ## 9. Outcome Demonstration  
 
-### 📸 *Insert your outcome images here*
-
-```markdown
-![Outcome 1](outcome_1.jpg)
-![Outcome 2](outcome_2.jpg)
-```
-
 ### 🎥 *Project Video*  
 https://vimeo.com/1138944508
 
