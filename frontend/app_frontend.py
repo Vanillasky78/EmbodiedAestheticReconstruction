@@ -21,9 +21,7 @@ from streamlit_webrtc import (
     webrtc_streamer,
 )
 
-# ============================================================
-# PATHS & CONSTANTS
-# ============================================================
+# =================== PATHS & CONSTANTS ===================
 
 FRONTEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = FRONTEND_DIR.parent
@@ -69,8 +67,12 @@ YELLOW = (255, 235, 59)
 BLACK = (0, 0, 0)
 HOT_PINK = (255, 30, 180)
 
-# Slightly smaller max width so full artwork fits on screen
-RIGHT_IMG_MAXW = 840
+RIGHT_IMG_MAXW = 900
+
+# Unified artwork canvas (让右侧画面比例统一，更接近摄像头画面)
+CANVAS_W = 1280
+CANVAS_H = 720
+CANVAS_RATIO = CANVAS_W / CANVAS_H
 
 # Diversity / randomness control
 MAX_RECENT = 6          # how many artworks to remember
@@ -79,9 +81,7 @@ TAIL_TOP_K = 10         # search in top-10 in total
 TAIL_RANDOM_PROB = 0.3  # 30% chance to look into 4–10 first
 
 
-# ============================================================
-# UTILITIES: METADATA
-# ============================================================
+# =================== UTILITIES ===================
 
 _META_CACHE: Optional[Dict[str, Dict]] = None
 
@@ -120,10 +120,6 @@ def lookup_meta(filename: str) -> Dict:
     mapping = load_meta_mapping()
     return mapping.get(filename, {})
 
-
-# ============================================================
-# UTILITIES: IMAGES & LABELS
-# ============================================================
 
 def safe_open_image(p: Path) -> Optional[Image.Image]:
     try:
@@ -338,6 +334,58 @@ def overlay_right_labels(painting: Image.Image, meta: Dict) -> Image.Image:
     return im
 
 
+def format_painting_canvas(painting: Image.Image) -> Image.Image:
+    """
+    仅做视觉层处理：
+    1) 裁剪为统一宽屏比例 (CANVAS_W : CANVAS_H)，让左右画面更对齐
+    2) 缩放到统一分辨率
+    3) 加一个柔和暗角遮罩，保留中间人物更亮，边缘稍微压暗
+    """
+    img = painting.convert("RGB")
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return img
+
+    current_ratio = w / h
+    target_ratio = CANVAS_RATIO
+
+    # 居中裁剪到目标比例
+    if current_ratio > target_ratio:
+        # 太宽 → 裁左右
+        new_w = int(h * target_ratio)
+        x1 = max(0, (w - new_w) // 2)
+        x2 = x1 + new_w
+        crop_box = (x1, 0, x2, h)
+    else:
+        # 太高 → 裁上下
+        new_h = int(w / target_ratio)
+        y1 = max(0, (h - new_h) // 2)
+        y2 = y1 + new_h
+        crop_box = (0, y1, w, y2)
+
+    img = img.crop(crop_box)
+    img = img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+
+    # 生成暗角遮罩
+    yy, xx = np.mgrid[0:CANVAS_H, 0:CANVAS_W]
+    cx, cy = CANVAS_W / 2.0, CANVAS_H / 2.0
+    nx = (xx - cx) / cx
+    ny = (yy - cy) / cy
+    r = np.sqrt(nx * nx + ny * ny)
+
+    # 半径 0~1 之间中心亮、边缘暗
+    # 0.25 以内几乎不衰减，0.25~1 之间逐渐降到 0.55
+    softness = 0.55
+    vignette = 1.0 - np.clip((r - 0.25) / (1.0 - 0.25), 0.0, 1.0) * softness
+    vignette = vignette[..., None]
+
+    arr = np.asarray(img).astype("float32") / 255.0
+    arr = arr * vignette
+    arr = np.clip(arr * 255.0, 0, 255).astype("uint8")
+
+    return Image.fromarray(arr)
+
+
 def force_rerun():
     """Compatible with new/old Streamlit."""
     try:
@@ -349,12 +397,11 @@ def force_rerun():
             pass
 
 
-# ============================================================
-# YOLO VIDEO PROCESSOR
-# ============================================================
+# =================== YOLO VIDEO PROCESSOR ===================
 
 try:
     from ultralytics import YOLO
+
     HAS_YOLO = True
 except Exception:
     HAS_YOLO = False
@@ -503,9 +550,7 @@ class CuratorialProcessor(VideoProcessorBase):
         return av.VideoFrame.from_ndarray(out_bgr, format="bgr24")
 
 
-# ============================================================
-# PAGE LAYOUT / GLOBAL STYLES
-# ============================================================
+# =================== PAGE LAYOUT ===================
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
@@ -518,7 +563,6 @@ header, footer, [data-testid="stToolbar"] {{ visibility: hidden !important; }}
 body {{
   background-color: #f5f5f7;
 }}
-
 .block-container {{
   padding-top: 0.6rem;
   padding-bottom: 0.6rem;
@@ -538,7 +582,7 @@ h1 {{
   overflow: hidden;
   border-radius: 18px;
   background: #111;
-  box-shadow: 0 18px 45px rgba(0,0,0,0.30);
+  box-shadow: 0 18px 45px rgba(0,0,0,0.3);
 }}
 .left-col .cam-wrap video {{
   height: 100% !important;
@@ -550,7 +594,7 @@ h1 {{
 .right-col .art-wrap {{
   position: relative;
   height: 80vh;
-  max-width: %(RIGHT_IMG_MAXW)spx;
+  max-width: {RIGHT_IMG_MAXW}px;
   overflow: hidden;
   margin: 0 auto;
   border-radius: 18px;
@@ -561,22 +605,14 @@ h1 {{
   display: block;
   width: 100% !important;
   height: 100% !important;
-  object-fit: contain !important;  /* show full artwork */
+  object-fit: cover !important;
 }}
 
 button[kind="secondary"] {{
   border-radius: 999px !important;
 }}
-
-/* On very small screens, stack columns vertically */
-@media (max-width: 900px) {{
-  div[data-testid="column"] > div:first-child {{
-    width: 100% !important;
-  }}
-}}
-
 </style>
-""" % {"RIGHT_IMG_MAXW": RIGHT_IMG_MAXW},
+""",
     unsafe_allow_html=True,
 )
 
@@ -593,10 +629,6 @@ except Exception:
 
 left, right = st.columns([1, 1], gap="large")
 
-# ============================================================
-# SESSION STATE
-# ============================================================
-
 if "countdown_target" not in st.session_state:
     st.session_state["countdown_target"] = None
 if "last_match" not in st.session_state:
@@ -607,16 +639,11 @@ if "last_ts" not in st.session_state:
     st.session_state["last_ts"] = 0.0
 if "recent_files" not in st.session_state:
     st.session_state["recent_files"] = []  # type: List[str]
-if "match_mode" not in st.session_state:
-    st.session_state["match_mode"] = "default"
 
 API_URL = DEFAULT_API_URL
-current_match_mode = st.session_state["match_mode"]
 
 
-# ============================================================
-# LEFT PANEL
-# ============================================================
+# =================== LEFT PANEL ===================
 
 with left:
     st.subheader("Live")
@@ -661,12 +688,19 @@ with left:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# ============================================================
-# RIGHT PANEL
-# ============================================================
+# =================== RIGHT PANEL ===================
 
 with right:
     st.subheader("Matched artwork")
+
+    # Match mode control
+    match_mode = st.selectbox(
+        "Match mode",
+        ["default", "portrait_only", "high_value_only", "portrait_high_value"],
+        index=0,
+        help="Use 'portrait_only' to bias towards clear portraits; "
+             "'high_value_only' for masterpieces.",
+    )
 
     st.markdown('<div class="right-col">', unsafe_allow_html=True)
     st.markdown('<div class="art-wrap">', unsafe_allow_html=True)
@@ -698,7 +732,7 @@ with right:
             data = {
                 "museum": "mixed",
                 "topk": TAIL_TOP_K,
-                "mode": current_match_mode,
+                "mode": match_mode,
             }
 
             try:
@@ -783,6 +817,9 @@ with right:
                     if painting is None:
                         ph.error(f"Failed to open: {img_path}")
                     else:
+                        # 先统一画布比例 + 暗角遮罩（只影响视觉）
+                        painting_canvas = format_painting_canvas(painting)
+
                         meta_row = lookup_meta(str(filename))
                         meta = {
                             "artist": meta_row.get("artist")
@@ -795,7 +832,7 @@ with right:
                             "filename": filename,
                         }
 
-                        painted = overlay_right_labels(painting, meta)
+                        painted = overlay_right_labels(painting_canvas, meta)
                         metrics = st.session_state.get("last_metrics") or []
                         painted = draw_tiny_metrics_top_right(
                             painted, metrics, size=16, margin=12
@@ -807,25 +844,3 @@ with right:
 
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
-
-    # ----- Match mode DROPDOWN placed under artwork for better visual balance -----
-    mode_container = st.container()
-    with mode_container:
-        options = [
-            "default",
-            "portrait_only",
-            "high_value_only",
-            "portrait_high_value",
-        ]
-        idx = options.index(current_match_mode) if current_match_mode in options else 0
-        selected = st.selectbox(
-            "Match mode",
-            options,
-            index=idx,
-            help=(
-                "Use 'portrait_only' to bias towards clear portraits; "
-                "'high_value_only' for masterpieces; "
-                "'portrait_high_value' to combine both."
-            ),
-        )
-        st.session_state["match_mode"] = selected
