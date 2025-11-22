@@ -69,18 +69,17 @@ HOT_PINK = (255, 30, 180)
 
 RIGHT_IMG_MAXW = 900
 
+# Unified artwork canvas (让右侧画面比例统一，更接近摄像头画面)
+CANVAS_W = 1280
+CANVAS_H = 720
+CANVAS_RATIO = CANVAS_W / CANVAS_H
+
 # Diversity / randomness control
 MAX_RECENT = 6          # how many artworks to remember
 PRIMARY_TOP_K = 3       # "very best" range
 TAIL_TOP_K = 10         # search in top-10 in total
 TAIL_RANDOM_PROB = 0.3  # 30% chance to look into 4–10 first
 
-MATCH_MODE_OPTIONS = [
-    "default",
-    "portrait_only",
-    "high_value_only",
-    "portrait_high_value",
-]
 
 # =================== UTILITIES ===================
 
@@ -335,6 +334,58 @@ def overlay_right_labels(painting: Image.Image, meta: Dict) -> Image.Image:
     return im
 
 
+def format_painting_canvas(painting: Image.Image) -> Image.Image:
+    """
+    仅做视觉层处理：
+    1) 裁剪为统一宽屏比例 (CANVAS_W : CANVAS_H)，让左右画面更对齐
+    2) 缩放到统一分辨率
+    3) 加一个柔和暗角遮罩，保留中间人物更亮，边缘稍微压暗
+    """
+    img = painting.convert("RGB")
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return img
+
+    current_ratio = w / h
+    target_ratio = CANVAS_RATIO
+
+    # 居中裁剪到目标比例
+    if current_ratio > target_ratio:
+        # 太宽 → 裁左右
+        new_w = int(h * target_ratio)
+        x1 = max(0, (w - new_w) // 2)
+        x2 = x1 + new_w
+        crop_box = (x1, 0, x2, h)
+    else:
+        # 太高 → 裁上下
+        new_h = int(w / target_ratio)
+        y1 = max(0, (h - new_h) // 2)
+        y2 = y1 + new_h
+        crop_box = (0, y1, w, y2)
+
+    img = img.crop(crop_box)
+    img = img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+
+    # 生成暗角遮罩
+    yy, xx = np.mgrid[0:CANVAS_H, 0:CANVAS_W]
+    cx, cy = CANVAS_W / 2.0, CANVAS_H / 2.0
+    nx = (xx - cx) / cx
+    ny = (yy - cy) / cy
+    r = np.sqrt(nx * nx + ny * ny)
+
+    # 半径 0~1 之间中心亮、边缘暗
+    # 0.25 以内几乎不衰减，0.25~1 之间逐渐降到 0.55
+    softness = 0.55
+    vignette = 1.0 - np.clip((r - 0.25) / (1.0 - 0.25), 0.0, 1.0) * softness
+    vignette = vignette[..., None]
+
+    arr = np.asarray(img).astype("float32") / 255.0
+    arr = arr * vignette
+    arr = np.clip(arr * 255.0, 0, 255).astype("uint8")
+
+    return Image.fromarray(arr)
+
+
 def force_rerun():
     """Compatible with new/old Streamlit."""
     try:
@@ -526,29 +577,26 @@ h1 {{
 
 .left-col .cam-wrap {{
   position: relative;
+  height: 80vh;
   width: 100%;
-  max-width: 520px;
-  aspect-ratio: 9 / 16;
-  margin: 0 auto;
   overflow: hidden;
   border-radius: 18px;
   background: #111;
   box-shadow: 0 18px 45px rgba(0,0,0,0.3);
 }}
 .left-col .cam-wrap video {{
-  width: 100% !important;
   height: 100% !important;
+  width: auto !important;
   object-fit: cover !important;
   border-radius: 18px !important;
 }}
 
 .right-col .art-wrap {{
   position: relative;
-  width: 100%;
-  max-width: 520px;
-  aspect-ratio: 9 / 16;
-  margin: 0 auto;
+  height: 80vh;
+  max-width: {RIGHT_IMG_MAXW}px;
   overflow: hidden;
+  margin: 0 auto;
   border-radius: 18px;
   background: #050505;
   box-shadow: 0 18px 45px rgba(0,0,0,0.35);
@@ -558,11 +606,6 @@ h1 {{
   width: 100% !important;
   height: 100% !important;
   object-fit: cover !important;
-}}
-
-.right-col .mode-wrap {{
-  max-width: 520px;
-  margin: 1.2rem auto 0 auto;
 }}
 
 button[kind="secondary"] {{
@@ -586,7 +629,6 @@ except Exception:
 
 left, right = st.columns([1, 1], gap="large")
 
-# Session state
 if "countdown_target" not in st.session_state:
     st.session_state["countdown_target"] = None
 if "last_match" not in st.session_state:
@@ -597,11 +639,9 @@ if "last_ts" not in st.session_state:
     st.session_state["last_ts"] = 0.0
 if "recent_files" not in st.session_state:
     st.session_state["recent_files"] = []  # type: List[str]
-if "match_mode" not in st.session_state:
-    st.session_state["match_mode"] = MATCH_MODE_OPTIONS[0]
 
 API_URL = DEFAULT_API_URL
-current_mode_for_query = st.session_state.get("match_mode", MATCH_MODE_OPTIONS[0])
+
 
 # =================== LEFT PANEL ===================
 
@@ -652,6 +692,16 @@ with left:
 
 with right:
     st.subheader("Matched artwork")
+
+    # Match mode control
+    match_mode = st.selectbox(
+        "Match mode",
+        ["default", "portrait_only", "high_value_only", "portrait_high_value"],
+        index=0,
+        help="Use 'portrait_only' to bias towards clear portraits; "
+             "'high_value_only' for masterpieces.",
+    )
+
     st.markdown('<div class="right-col">', unsafe_allow_html=True)
     st.markdown('<div class="art-wrap">', unsafe_allow_html=True)
 
@@ -682,7 +732,7 @@ with right:
             data = {
                 "museum": "mixed",
                 "topk": TAIL_TOP_K,
-                "mode": current_mode_for_query,
+                "mode": match_mode,
             }
 
             try:
@@ -767,6 +817,9 @@ with right:
                     if painting is None:
                         ph.error(f"Failed to open: {img_path}")
                     else:
+                        # 先统一画布比例 + 暗角遮罩（只影响视觉）
+                        painting_canvas = format_painting_canvas(painting)
+
                         meta_row = lookup_meta(str(filename))
                         meta = {
                             "artist": meta_row.get("artist")
@@ -779,7 +832,7 @@ with right:
                             "filename": filename,
                         }
 
-                        painted = overlay_right_labels(painting, meta)
+                        painted = overlay_right_labels(painting_canvas, meta)
                         metrics = st.session_state.get("last_metrics") or []
                         painted = draw_tiny_metrics_top_right(
                             painted, metrics, size=16, margin=12
@@ -790,19 +843,4 @@ with right:
                         ph.image(painted, caption=caption, width=w)
 
     st.markdown("</div>", unsafe_allow_html=True)
-
-    # Match mode selector UNDER the artwork (symmetrical with left buttons)
-    st.markdown('<div class="mode-wrap">', unsafe_allow_html=True)
-    default_mode = st.session_state.get("match_mode", MATCH_MODE_OPTIONS[0])
-    mode_index = MATCH_MODE_OPTIONS.index(default_mode) if default_mode in MATCH_MODE_OPTIONS else 0
-    match_mode = st.selectbox(
-        "Match mode",
-        MATCH_MODE_OPTIONS,
-        index=mode_index,
-        help="Use 'portrait_only' to bias towards clear portraits; "
-             "'high_value_only' for masterpieces.",
-    )
-    st.session_state["match_mode"] = match_mode
-    st.markdown("</div>", unsafe_allow_html=True)
-
     st.markdown("</div>", unsafe_allow_html=True)
