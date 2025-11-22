@@ -69,11 +69,6 @@ HOT_PINK = (255, 30, 180)
 
 RIGHT_IMG_MAXW = 900
 
-# Unified artwork canvas (让右侧画面比例统一，更接近摄像头画面)
-CANVAS_W = 1280
-CANVAS_H = 720
-CANVAS_RATIO = CANVAS_W / CANVAS_H
-
 # Diversity / randomness control
 MAX_RECENT = 6          # how many artworks to remember
 PRIMARY_TOP_K = 3       # "very best" range
@@ -334,58 +329,6 @@ def overlay_right_labels(painting: Image.Image, meta: Dict) -> Image.Image:
     return im
 
 
-def format_painting_canvas(painting: Image.Image) -> Image.Image:
-    """
-    仅做视觉层处理：
-    1) 裁剪为统一宽屏比例 (CANVAS_W : CANVAS_H)，让左右画面更对齐
-    2) 缩放到统一分辨率
-    3) 加一个柔和暗角遮罩，保留中间人物更亮，边缘稍微压暗
-    """
-    img = painting.convert("RGB")
-    w, h = img.size
-    if w <= 0 or h <= 0:
-        return img
-
-    current_ratio = w / h
-    target_ratio = CANVAS_RATIO
-
-    # 居中裁剪到目标比例
-    if current_ratio > target_ratio:
-        # 太宽 → 裁左右
-        new_w = int(h * target_ratio)
-        x1 = max(0, (w - new_w) // 2)
-        x2 = x1 + new_w
-        crop_box = (x1, 0, x2, h)
-    else:
-        # 太高 → 裁上下
-        new_h = int(w / target_ratio)
-        y1 = max(0, (h - new_h) // 2)
-        y2 = y1 + new_h
-        crop_box = (0, y1, w, y2)
-
-    img = img.crop(crop_box)
-    img = img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
-
-    # 生成暗角遮罩
-    yy, xx = np.mgrid[0:CANVAS_H, 0:CANVAS_W]
-    cx, cy = CANVAS_W / 2.0, CANVAS_H / 2.0
-    nx = (xx - cx) / cx
-    ny = (yy - cy) / cy
-    r = np.sqrt(nx * nx + ny * ny)
-
-    # 半径 0~1 之间中心亮、边缘暗
-    # 0.25 以内几乎不衰减，0.25~1 之间逐渐降到 0.55
-    softness = 0.55
-    vignette = 1.0 - np.clip((r - 0.25) / (1.0 - 0.25), 0.0, 1.0) * softness
-    vignette = vignette[..., None]
-
-    arr = np.asarray(img).astype("float32") / 255.0
-    arr = arr * vignette
-    arr = np.clip(arr * 255.0, 0, 255).astype("uint8")
-
-    return Image.fromarray(arr)
-
-
 def force_rerun():
     """Compatible with new/old Streamlit."""
     try:
@@ -611,6 +554,7 @@ h1 {{
 button[kind="secondary"] {{
   border-radius: 999px !important;
 }}
+
 </style>
 """,
     unsafe_allow_html=True,
@@ -817,9 +761,6 @@ with right:
                     if painting is None:
                         ph.error(f"Failed to open: {img_path}")
                     else:
-                        # 先统一画布比例 + 暗角遮罩（只影响视觉）
-                        painting_canvas = format_painting_canvas(painting)
-
                         meta_row = lookup_meta(str(filename))
                         meta = {
                             "artist": meta_row.get("artist")
@@ -832,7 +773,7 @@ with right:
                             "filename": filename,
                         }
 
-                        painted = overlay_right_labels(painting_canvas, meta)
+                        painted = overlay_right_labels(painting, meta)
                         metrics = st.session_state.get("last_metrics") or []
                         painted = draw_tiny_metrics_top_right(
                             painted, metrics, size=16, margin=12
