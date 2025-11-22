@@ -1,0 +1,54 @@
+# ───────── OS / Editor junk ─────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ───────── Python cache ─────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# ───────── Virtual envs ─────────
+.venv/
+venv/
+env/
+.env
+
+# ───────── Logs / temp ─────────
+*.log
+*.tmp
+*.swp
+*.swo
+
+# ───────── Jupyter notebooks ─────────
+.ipynb_checkpoints/
+
+# ───────── Streamlit ─────────
+.streamlit/
+
+# ───────── Model & index files (large, can be regenerated) ─────────
+# CLIP / pose embeddings & indexes
+data/**/embeddings*.npy
+data/**/pose_embeddings*.npy
+data/**/faiss_index*
+data/**/index*.bin
+
+# Checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+
+# 如果你想把 yolov8n-pose.pt 保留在仓库里，可以取消下一行注释
+#!yolov8n-pose.pt
+
+# ───────── Local datasets (可选：如果以后加很大的本地数据) ─────────
+#data/local/raw/**
+#data/met/raw/**
+#data/aic/raw/**
+
+# ───────── Misc cache ─────────
+.cache/
+**/__pycache__/
